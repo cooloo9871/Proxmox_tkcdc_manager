@@ -133,7 +133,7 @@ download_image() {
         info "Copying image to node: $node"
         ssh -n "root@$(node_addr "$node")" "mkdir -p ${IMAGE_DIR}" 2>/dev/null || \
             { warn "SSH to $node failed, skipping image copy"; continue; }
-        scp -q "$img_path" "root@$(node_addr "$node"):${img_path}" || \
+        scp -q -o StrictHostKeyChecking=no "$img_path" "root@$(node_addr "$node"):${img_path}" || \
             warn "Failed to copy image to $node"
     done
 }
@@ -161,6 +161,7 @@ generate_user_data() {
     # cloud-init will decode and write it to /tmp/xrdp-installer-<ver>.sh
     local py_script
     py_script=$(mktemp /tmp/inject_xrdp_XXXXXX.py)
+    trap "rm -f '${py_script}'" RETURN
     cat > "$py_script" << 'PYEOF'
 import sys, base64
 
@@ -194,7 +195,6 @@ with open(yaml_file, 'w') as f:
     f.write(content)
 PYEOF
     python3 "$py_script" "$yaml_path" "$xrdp_script"
-    rm -f "$py_script"
 
     echo "$yaml_path"
 }
@@ -229,7 +229,7 @@ create_vm() {
     run_on_node "$node" \
         "qm set ${vmid} \
             --scsihw virtio-scsi-pci \
-            --scsi0 ${STORAGE}:vm-${vmid}-disk-0"
+            --scsi0 ${STORAGE}:vm-${vmid}-disk-0,discard=on"
 
     # 4. Resize disk
     run_on_node "$node" \
@@ -262,8 +262,8 @@ create_vm() {
 
     # Copy yaml to remote node if needed
     if [[ "$node" != "$EXECUTE_NODE" ]]; then
-        ssh -n "root@$(node_addr "$node")" "mkdir -p ${SNIPPET_DIR}"
-        scp -q "$yaml_path" "root@$(node_addr "$node"):${yaml_path}" || \
+        ssh -n -o StrictHostKeyChecking=no "root@$(node_addr "$node")" "mkdir -p ${SNIPPET_DIR}"
+        scp -q -o StrictHostKeyChecking=no "$yaml_path" "root@$(node_addr "$node"):${yaml_path}" || \
             warn "Failed to copy user-data to $node"
     fi
 
@@ -302,9 +302,11 @@ cmd_start() {
     for entry in "${VM_LIST[@]}"; do
         IFS=':' read -r vmid hostname ip node <<< "$entry"
         info "Starting VM ${vmid} (${hostname}) on ${node}"
-        run_on_node "$node" "qm start ${vmid}" && \
-            log "start vm ${vmid} success" || \
+        if run_on_node "$node" "qm start ${vmid}"; then
+            log "start vm ${vmid} success"
+        else
             warn "Failed to start vm ${vmid}"
+        fi
     done
 }
 
@@ -314,9 +316,11 @@ cmd_stop() {
     for entry in "${VM_LIST[@]}"; do
         IFS=':' read -r vmid hostname ip node <<< "$entry"
         info "Stopping VM ${vmid} (${hostname}) on ${node}"
-        run_on_node "$node" "qm stop ${vmid}" && \
-            log "stop vm ${vmid} completed" || \
+        if run_on_node "$node" "qm stop ${vmid}"; then
+            log "stop vm ${vmid} completed"
+        else
             warn "Failed to stop vm ${vmid}"
+        fi
     done
 }
 
@@ -346,9 +350,8 @@ cmd_delete() {
         fi
     done
 
-    # Clean up logs
-    rm -f "$LOG_FILE" "$EXEC_LOG"
     log "Delete completed"
+    rm -f "$LOG_FILE" "$EXEC_LOG"
 }
 
 # ── SELECT STORAGE (interactive helper) ───────────────────────
@@ -432,33 +435,42 @@ except:
 
             # Try 2: SSH fallback (sshpass) if guest agent not responding
             if [[ -z "$ga_out" ]] && command -v sshpass &>/dev/null; then
-                local vm_ip
-                # Derive VM IP from VM_LIST entry
-                vm_ip="$ip"
-                ga_out=$(sshpass -p "${VM_PASSWORD}" \
-                    ssh -n -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-                    -o PreferredAuthentications=password -o PubkeyAuthentication=no \
-                    "${VM_USER}@${vm_ip}" \
-                    "$(printf '%s' "$_check_script")" 2>/dev/null || true)
+                # Check SSH port first; if closed the VM is still booting
+                if ! timeout 3 bash -c "echo >/dev/tcp/${ip}/22" 2>/dev/null; then
+                    ci_label="Booting..."
+                else
+                    ga_out=$(sshpass -p "${VM_PASSWORD}" \
+                        ssh -n \
+                        -o StrictHostKeyChecking=no \
+                        -o ConnectTimeout=5 \
+                        -o IdentitiesOnly=yes \
+                        -o PubkeyAuthentication=no \
+                        -o PreferredAuthentications=password,keyboard-interactive \
+                        -o NumberOfPasswordPrompts=1 \
+                        "${VM_USER}@${ip}" \
+                        "$(printf '%s' "$_check_script")" 2>/dev/null || true)
+                fi
             fi
 
-            case "$ga_out" in
-                DONE)        ci_label="Ready" ;;
-                ERROR)       ci_label="Error (check /var/log/cloud-init-output.log)" ;;
-                XRDP_DONE)   ci_label="Finalizing setup..." ;;
-                PKGS_DONE)   ci_label="Installing xrdp..." ;;
-                INSTALLING)  ci_label="Installing packages..." ;;
-                *)           ci_label="Waiting..." ;;
-            esac
+            if [[ -z "$ci_label" || "$ci_label" == "—" ]]; then
+                case "$ga_out" in
+                    DONE)        ci_label="Ready" ;;
+                    ERROR)       ci_label="Error (see /var/log/cloud-init-output.log)" ;;
+                    XRDP_DONE)   ci_label="Finalizing setup..." ;;
+                    PKGS_DONE)   ci_label="Installing xrdp..." ;;
+                    INSTALLING)  ci_label="Installing packages..." ;;
+                    *)           ci_label="Waiting..." ;;
+                esac
+            fi
         fi
 
         # ── Colorize ────────────────────────────────────────────
         local color="$NC"
         case "$ci_label" in
-            Ready)      color="$GREEN"  ;;
-            Error*)     color="$RED"    ;;
-            Waiting*)   color="$NC"     ;;
-            *)          color="$YELLOW" ;;
+            Ready)                    color="$GREEN"  ;;
+            Error*)                   color="$RED"    ;;
+            Booting*|Waiting*)        color="$NC"     ;;
+            *)                        color="$YELLOW" ;;
         esac
 
         printf "  %-8s %-18s %-18s %-10s %-10s " \

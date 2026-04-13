@@ -46,14 +46,19 @@ write_files:
       KbdInteractiveAuthentication yes
       UsePAM yes
 
-  # xrdp post-config: set crypt_level=low and max_bpp=24
+  # xrdp post-config: performance tuning
   - path: /tmp/fix-xrdp-ini.sh
     permissions: '0755'
     owner: root:root
     content: |
       #!/bin/bash
+      # Low encryption - no need for strong crypto on LAN
       sed -i 's/^crypt_level=.*/crypt_level=low/' /etc/xrdp/xrdp.ini
+      # 24-bit colour is a good balance of quality vs bandwidth
       sed -i 's/^max_bpp=.*/max_bpp=24/' /etc/xrdp/xrdp.ini
+      # Increase TCP send/recv buffers from 32 KB to 4 MB for smoother display
+      sed -i 's/^#tcp_send_buffer_bytes=.*/tcp_send_buffer_bytes=4194304/' /etc/xrdp/xrdp.ini
+      sed -i 's/^#tcp_recv_buffer_bytes=.*/tcp_recv_buffer_bytes=4194304/' /etc/xrdp/xrdp.ini
       systemctl restart xrdp
 
   # Firefox: Mozilla PPA apt preferences (avoids snap, ensures deb version)
@@ -66,6 +71,27 @@ write_files:
       Package: firefox*
       Pin: release o=LP-PPA-mozillateam
       Pin-Priority: 501
+
+  # Xfce4 performance: disable compositor (biggest xrdp lag source)
+  - path: /tmp/setup-xfce4-perf.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      USERNAME="__VM_USER__"
+      XFCE_DIR="/home/${USERNAME}/.config/xfce4/xfconf/xfce-perchannel-xml"
+      mkdir -p "${XFCE_DIR}"
+      # Write xfwm4 config: disable compositor and vblank
+      # Compositor causes full-screen repaints on every window event - very slow over RDP
+      printf '%s\n' \
+        '<?xml version="1.0" encoding="UTF-8"?>' \
+        '<channel name="xfwm4" version="1.0">' \
+        '  <property name="general" type="empty">' \
+        '    <property name="use_compositing" type="bool" value="false"/>' \
+        '    <property name="vblank_mode" type="string" value="off"/>' \
+        '  </property>' \
+        '</channel>' > "${XFCE_DIR}/xfwm4.xml"
+      chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config"
 
   # Podman rootless setup script (runs as VM_USER)
   - path: /tmp/setup-podman-rootless.sh
@@ -119,8 +145,10 @@ runcmd:
   # Ensure xfce4 is the xrdp session (c-nergy may not detect desktop in cloud-init)
   - echo "startxfce4" > /home/__VM_USER__/.xsessionrc
   - chown __VM_USER__:__VM_USER__ /home/__VM_USER__/.xsessionrc
-  # Apply low-encryption config
+  # Apply xrdp performance config (low-crypto, TCP buffers)
   - bash /tmp/fix-xrdp-ini.sh
+  # Disable Xfce4 compositor before first login
+  - bash /tmp/setup-xfce4-perf.sh
   # ── Firefox deb (via Mozilla PPA, avoids snap sandbox issues in xrdp) ──
   - add-apt-repository -y ppa:mozillateam/ppa
   - apt-get install -y firefox
@@ -130,7 +158,7 @@ runcmd:
   # already fired before install, so re-trigger to activate the service)
   - udevadm trigger --subsystem-match=virtio-ports
   # ── Cleanup ─────────────────────────────────────────────────
-  - rm -f /tmp/xrdp-installer.sh /tmp/fix-xrdp-ini.sh /tmp/setup-podman-rootless.sh
+  - rm -f /tmp/xrdp-installer.sh /tmp/fix-xrdp-ini.sh /tmp/setup-xfce4-perf.sh /tmp/setup-podman-rootless.sh
 
 final_message: |
   tkcdc VM __VM_HOSTNAME__ is ready.
