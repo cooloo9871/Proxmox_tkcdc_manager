@@ -33,8 +33,9 @@ load_config() {
     VM_COUNT=$(( VMID_END - VMID_START + 1 ))
     [[ $VM_COUNT -le 0 ]] && error "VMID_END must be >= VMID_START"
 
+    # bash 陣列無法 export，env.conf 須直接宣告 NODE_LIST=(...) 不加 export
     NODE_COUNT=${#NODE_LIST[@]}
-    [[ $NODE_COUNT -eq 0 ]] && error "NODE_LIST is empty"
+    [[ $NODE_COUNT -eq 0 ]] && error "NODE_LIST is empty. In env.conf use: NODE_LIST=('n1' 'n2') without export"
 }
 
 # ── Run command on a remote PVE node via SSH ─────────────────
