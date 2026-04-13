@@ -367,19 +367,105 @@ cmd_select_storage() {
     fi
 }
 
-# ── STATUS: show current VM state ─────────────────────────────
+# ── STATUS: show current VM state and cloud-init progress ───────
 cmd_status() {
+    # Script run inside each VM via qemu guest agent.
+    # Detects which cloud-init stage is in progress by checking installed packages.
+    local _check_script='
+status=$(cloud-init status 2>/dev/null | cut -d" " -f2)
+if [ "$status" = "done" ]; then
+    echo "DONE"
+elif [ "$status" = "error" ]; then
+    echo "ERROR"
+elif dpkg -l xrdp 2>/dev/null | grep -q "^ii"; then
+    echo "XRDP_DONE"
+elif dpkg -l xfce4 2>/dev/null | grep -q "^ii"; then
+    echo "PKGS_DONE"
+else
+    echo "INSTALLING"
+fi'
+    local script_b64
+    script_b64=$(printf '%s' "$_check_script" | base64 -w0)
+
     stage "VM Status"
-    echo -e "  ${CYAN}$(printf '%-8s %-18s %-18s %-10s %-10s' VMID HOSTNAME IP NODE STATUS)${NC}"
-    echo "  $(printf '%0.s─' {1..66})"
+    printf "  ${CYAN}%-8s %-18s %-18s %-10s %-10s %s${NC}\n" \
+        "VMID" "HOSTNAME" "IP" "NODE" "VM" "CLOUD-INIT"
+    echo "  $(printf '%0.s─' {1..90})"
+
     for entry in "${VM_LIST[@]}"; do
         IFS=':' read -r vmid hostname ip node <<< "$entry"
-        local status
-        status=$(ssh -n -o BatchMode=yes -o ConnectTimeout=3 "root@$(node_addr "$node")" \
-            "qm status ${vmid} 2>/dev/null | awk '{print \$2}'" 2>/dev/null || echo "unknown")
-        printf "  %-8s %-18s %-18s %-10s %-10s\n" \
-            "$vmid" "$hostname" "$ip" "$node" "$status"
+
+        # ── VM power state ──────────────────────────────────────
+        local vm_state
+        if [[ "$node" == "$EXECUTE_NODE" ]]; then
+            vm_state=$(qm status "$vmid" 2>/dev/null | awk '{print $2}' || echo "unknown")
+        else
+            vm_state=$(ssh -n -o BatchMode=yes -o ConnectTimeout=3 \
+                "root@$(node_addr "$node")" \
+                "qm status ${vmid} 2>/dev/null | awk '{print \$2}'" 2>/dev/null || echo "unknown")
+        fi
+
+        # ── Cloud-init progress (guest agent → SSH fallback) ────
+        local ci_label="—"
+        if [[ "$vm_state" == "running" ]]; then
+            local ga_raw="" ga_out=""
+
+            # Try 1: qm guest exec (requires qemu-guest-agent running inside VM)
+            if [[ "$node" == "$EXECUTE_NODE" ]]; then
+                ga_raw=$(qm guest exec "$vmid" --timeout 10 -- \
+                    bash -c "echo ${script_b64} | base64 -d | bash" 2>/dev/null || true)
+            else
+                ga_raw=$(ssh -n -o BatchMode=yes -o ConnectTimeout=15 \
+                    "root@$(node_addr "$node")" \
+                    "qm guest exec ${vmid} --timeout 10 -- bash -c 'echo ${script_b64} | base64 -d | bash'" \
+                    2>/dev/null || true)
+            fi
+
+            # Parse JSON output from qm guest exec
+            ga_out=$(printf '%s' "$ga_raw" | python3 -c "
+import sys, json
+try:
+    print(json.load(sys.stdin).get('out-data','').strip())
+except:
+    pass
+" 2>/dev/null || true)
+
+            # Try 2: SSH fallback (sshpass) if guest agent not responding
+            if [[ -z "$ga_out" ]] && command -v sshpass &>/dev/null; then
+                local vm_ip
+                # Derive VM IP from VM_LIST entry
+                vm_ip="$ip"
+                ga_out=$(sshpass -p "${VM_PASSWORD}" \
+                    ssh -n -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                    -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+                    "${VM_USER}@${vm_ip}" \
+                    "$(printf '%s' "$_check_script")" 2>/dev/null || true)
+            fi
+
+            case "$ga_out" in
+                DONE)        ci_label="Ready" ;;
+                ERROR)       ci_label="Error (check /var/log/cloud-init-output.log)" ;;
+                XRDP_DONE)   ci_label="Finalizing setup..." ;;
+                PKGS_DONE)   ci_label="Installing xrdp..." ;;
+                INSTALLING)  ci_label="Installing packages..." ;;
+                *)           ci_label="Waiting..." ;;
+            esac
+        fi
+
+        # ── Colorize ────────────────────────────────────────────
+        local color="$NC"
+        case "$ci_label" in
+            Ready)      color="$GREEN"  ;;
+            Error*)     color="$RED"    ;;
+            Waiting*)   color="$NC"     ;;
+            *)          color="$YELLOW" ;;
+        esac
+
+        printf "  %-8s %-18s %-18s %-10s %-10s " \
+            "$vmid" "$hostname" "$ip" "$node" "$vm_state"
+        echo -e "${color}${ci_label}${NC}"
     done
+    echo ""
 }
 
 # ── Usage ──────────────────────────────────────────────────────

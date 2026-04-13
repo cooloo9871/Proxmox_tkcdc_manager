@@ -10,6 +10,7 @@
 
 hostname: __VM_HOSTNAME__
 manage_etc_hosts: true
+timezone: Asia/Taipei
 
 # ------------------------------------------------------------
 # Default user setup
@@ -55,6 +56,17 @@ write_files:
       sed -i 's/^max_bpp=.*/max_bpp=24/' /etc/xrdp/xrdp.ini
       systemctl restart xrdp
 
+  # Firefox: Mozilla PPA apt preferences (avoids snap, ensures deb version)
+  # Ubuntu 24.04 ships Firefox as snap by default; snap breaks in xrdp sessions.
+  # This pin ensures apt picks the deb from Mozilla PPA instead.
+  - path: /etc/apt/preferences.d/mozilla-firefox
+    permissions: '0644'
+    owner: root:root
+    content: |
+      Package: firefox*
+      Pin: release o=LP-PPA-mozillateam
+      Pin-Priority: 501
+
   # Podman rootless setup script (runs as VM_USER)
   - path: /tmp/setup-podman-rootless.sh
     permissions: '0755'
@@ -89,8 +101,10 @@ packages:
   - dbus-user-session
   - slirp4netns
   - uidmap
+  - qemu-guest-agent
   - xfce4
   - xfce4-goodies
+  - xfce4-terminal
 
 # ------------------------------------------------------------
 # Run commands at first boot
@@ -99,10 +113,6 @@ packages:
 runcmd:
   # ── SSH 重啟套用密碼登入設定 ────────────────────────────
   - systemctl restart ssh
-  # ── Firefox deb (via Mozilla PPA, avoids snap sandbox issues in xrdp) ──
-  - add-apt-repository -y ppa:mozillateam/ppa
-  - echo 'Package: firefox*\nPin: release o=LP-PPA-mozillateam\nPin-Priority: 501' > /etc/apt/preferences.d/mozilla-firefox
-  - apt-get install -y firefox
   # ── xrdp via local installer (injected by generate_user_data) ──
   # Script must run as a normal user (it calls sudo internally)
   - su - __VM_USER__ -c "bash /tmp/xrdp-installer.sh"
@@ -111,8 +121,14 @@ runcmd:
   - chown __VM_USER__:__VM_USER__ /home/__VM_USER__/.xsessionrc
   # Apply low-encryption config
   - bash /tmp/fix-xrdp-ini.sh
+  # ── Firefox deb (via Mozilla PPA, avoids snap sandbox issues in xrdp) ──
+  - add-apt-repository -y ppa:mozillateam/ppa
+  - apt-get install -y firefox
   # ── podman rootless ─────────────────────────────────────────
   - bash /tmp/setup-podman-rootless.sh
+  # ── Start qemu-guest-agent (installed via packages above, but udev event ──
+  # already fired before install, so re-trigger to activate the service)
+  - udevadm trigger --subsystem-match=virtio-ports
   # ── Cleanup ─────────────────────────────────────────────────
   - rm -f /tmp/xrdp-installer.sh /tmp/fix-xrdp-ini.sh /tmp/setup-podman-rootless.sh
 
