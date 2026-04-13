@@ -3,7 +3,7 @@
 # Proxmox_tkcdc_manager - Cloud-Init User Data Template
 # This file is generated per-VM by pve_tkcdc_manager.sh
 # Variables __VM_HOSTNAME__, __VM_USER__, __VM_PASSWORD__,
-# __NAMESERVER__, __XRDP_VER__ are replaced at runtime.
+# __NAMESERVER__ are replaced at runtime.
 # The xrdp installer script is injected as a base64-encoded
 # write_files entry by generate_user_data() at build time.
 # ============================================================
@@ -101,13 +101,13 @@ runcmd:
   - systemctl restart ssh
   # ── xrdp via local installer (injected by generate_user_data) ──
   # Run installer in non-interactive mode: option 3 = xfce
-  - echo "3" | bash "/tmp/xrdp-installer-__XRDP_VER__.sh" || true
+  - echo "3" | bash /tmp/xrdp-installer.sh || true
   # Apply low-encryption config
   - bash /tmp/fix-xrdp-ini.sh
   # ── podman rootless ─────────────────────────────────────────
   - bash /tmp/setup-podman-rootless.sh
   # ── Cleanup ─────────────────────────────────────────────────
-  - rm -f "/tmp/xrdp-installer-__XRDP_VER__.sh" /tmp/fix-xrdp-ini.sh /tmp/setup-podman-rootless.sh
+  - rm -f /tmp/xrdp-installer.sh /tmp/fix-xrdp-ini.sh /tmp/setup-podman-rootless.sh
 
 final_message: |
   tkcdc VM __VM_HOSTNAME__ is ready.

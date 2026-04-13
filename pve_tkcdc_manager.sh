@@ -143,17 +143,18 @@ generate_user_data() {
     local vmid="$1"
     local hostname="$2"
     local yaml_path="${SNIPPET_DIR}/tkcdc-${vmid}-user.yaml"
-    local xrdp_script="${SCRIPT_DIR}/xrdp-installer-${XRDP_INSTALLER_VERSION}.sh"
+    local xrdp_scripts=( "${SCRIPT_DIR}"/xrdp-installer-*.sh )
+    [[ -f "${xrdp_scripts[0]}" ]] || error "No xrdp-installer-*.sh found in ${SCRIPT_DIR}"
+    [[ ${#xrdp_scripts[@]} -gt 1 ]] && warn "Multiple xrdp installers found, using: ${xrdp_scripts[0]}"
+    local xrdp_script="${xrdp_scripts[0]}"
 
     [[ -f "$USER_DATA_TPL" ]] || error "Template not found: $USER_DATA_TPL"
-    [[ -f "$xrdp_script" ]] || error "xrdp installer not found: $xrdp_script"
 
     sed \
         -e "s|__VM_HOSTNAME__|${hostname}|g" \
         -e "s|__VM_USER__|${VM_USER}|g" \
         -e "s|__VM_PASSWORD__|${VM_PASSWORD}|g" \
         -e "s|__NAMESERVER__|${NAMESERVER}|g" \
-        -e "s|__XRDP_VER__|${XRDP_INSTALLER_VERSION}|g" \
         "$USER_DATA_TPL" > "$yaml_path"
 
     # Inject xrdp installer as base64-encoded write_files entry.
@@ -163,18 +164,18 @@ generate_user_data() {
     cat > "$py_script" << 'PYEOF'
 import sys, base64
 
-yaml_file, script_file, ver = sys.argv[1], sys.argv[2], sys.argv[3]
+yaml_file, script_file = sys.argv[1], sys.argv[2]
 
 with open(script_file, 'rb') as f:
     script_b64 = base64.b64encode(f.read()).decode()
 
 entry = (
-    "  - path: /tmp/xrdp-installer-%s.sh\n"
+    "  - path: /tmp/xrdp-installer.sh\n"
     "    permissions: '0755'\n"
     "    owner: root:root\n"
     "    encoding: b64\n"
     "    content: %s\n"
-) % (ver, script_b64)
+) % script_b64
 
 with open(yaml_file, 'r') as f:
     content = f.read()
@@ -192,7 +193,7 @@ if pos >= 0:
 with open(yaml_file, 'w') as f:
     f.write(content)
 PYEOF
-    python3 "$py_script" "$yaml_path" "$xrdp_script" "${XRDP_INSTALLER_VERSION}"
+    python3 "$py_script" "$yaml_path" "$xrdp_script"
     rm -f "$py_script"
 
     echo "$yaml_path"
