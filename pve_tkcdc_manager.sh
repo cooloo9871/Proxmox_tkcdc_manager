@@ -31,11 +31,11 @@ load_config() {
 
     # Derived values
     VM_COUNT=$(( VMID_END - VMID_START + 1 ))
-    [[ $VM_COUNT -le 0 ]] && error "VMID_END must be >= VMID_START"
+    if [[ $VM_COUNT -le 0 ]]; then error "VMID_END must be >= VMID_START"; fi
 
     # bash 陣列無法 export，env.conf 須直接宣告 NODE_LIST=(...) 不加 export
     NODE_COUNT=${#NODE_LIST[@]}
-    [[ $NODE_COUNT -eq 0 ]] && error "NODE_LIST is empty. In env.conf use: NODE_LIST=('n1' 'n2') without export"
+    if [[ $NODE_COUNT -eq 0 ]]; then error "NODE_LIST is empty. In env.conf use: NODE_LIST=('n1' 'n2') without export"; fi
 }
 
 # ── Run command on a remote PVE node via SSH ─────────────────
@@ -90,7 +90,7 @@ check_env() {
 
     # Check SSH connectivity to all nodes (skip EXECUTE_NODE)
     for node in "${NODE_LIST[@]}"; do
-        [[ "$node" == "$EXECUTE_NODE" ]] && continue
+        if [[ "$node" == "$EXECUTE_NODE" ]]; then continue; fi
         ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
             "root@${node}" "true" 2>/dev/null || \
             warn "SSH to node '${node}' failed. VMs assigned to it may fail."
@@ -123,9 +123,10 @@ download_image() {
 
     # Copy image to remote nodes
     for node in "${NODE_LIST[@]}"; do
-        [[ "$node" == "$EXECUTE_NODE" ]] && continue
+        if [[ "$node" == "$EXECUTE_NODE" ]]; then continue; fi
         info "Copying image to node: $node"
-        ssh "root@${node}" "mkdir -p ${IMAGE_DIR}"
+        ssh "root@${node}" "mkdir -p ${IMAGE_DIR}" 2>/dev/null || \
+            { warn "SSH to $node failed, skipping image copy"; continue; }
         scp -q "$img_path" "root@${node}:${img_path}" || \
             warn "Failed to copy image to $node"
     done
@@ -298,8 +299,7 @@ cmd_delete() {
 
         # Remove cloud-init yaml
         local yaml_path="${SNIPPET_DIR}/tkcdc-${vmid}-user.yaml"
-        [[ -f "$yaml_path" ]] && rm -f "$yaml_path" && \
-            info "Removed $yaml_path"
+        if [[ -f "$yaml_path" ]]; then rm -f "$yaml_path"; info "Removed $yaml_path"; fi
         if [[ "$node" != "$EXECUTE_NODE" ]]; then
             ssh "root@${node}" "rm -f ${yaml_path} 2>/dev/null || true"
         fi
