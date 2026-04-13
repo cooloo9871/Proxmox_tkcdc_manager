@@ -55,16 +55,16 @@ run_on_node() {
 build_vm_list() {
     VM_LIST=()
     local idx=0
+    local node_idx suffix node hostname last_octet ip
     for (( id=VMID_START; id<=VMID_END; id++ )); do
-        local node_idx=$(( idx % NODE_COUNT ))
-        local node="${NODE_LIST[$node_idx]}"
-        local suffix
+        node_idx=$(( idx % NODE_COUNT ))
+        node="${NODE_LIST[$node_idx]}"
         suffix=$(printf "%02d" $(( idx + 1 )))
-        local hostname="${VM_NAME_PREFIX}-${suffix}"
-        local last_octet=$(( VM_IP_START + idx ))
-        local ip="${VM_NET_PREFIX}.${last_octet}"
+        hostname="${VM_NAME_PREFIX}-${suffix}"
+        last_octet=$(( VM_IP_START + idx ))
+        ip="${VM_NET_PREFIX}.${last_octet}"
         VM_LIST+=("${id}:${hostname}:${ip}:${node}")
-        (( idx++ ))
+        idx=$(( idx + 1 ))   # 避免 (( idx++ )) 在 idx=0 時因回傳值 0 被 set -e 終止
     done
 }
 
