@@ -34,6 +34,16 @@ write_files:
     content: |
       nameserver __NAMESERVER__
 
+  # SSH: 覆寫 Ubuntu Cloud Image 預設的 60-cloudimg-settings.conf
+  # 該檔預設 PasswordAuthentication no，必須覆寫否則無法密碼登入
+  - path: /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
+    permissions: '0644'
+    owner: root:root
+    content: |
+      PasswordAuthentication yes
+      KbdInteractiveAuthentication yes
+      UsePAM yes
+
   # xrdp post-config: set crypt_level=low and max_bpp=24
   - path: /tmp/fix-xrdp-ini.sh
     permissions: '0755'
@@ -86,6 +96,8 @@ packages:
 # Order: install xrdp → configure → setup podman rootless
 # ------------------------------------------------------------
 runcmd:
+  # ── SSH 重啟套用密碼登入設定 ────────────────────────────
+  - systemctl restart ssh
   # ── xrdp via c-nergy installer ──────────────────────────
   - cd /tmp
   - wget -q "__XRDP_INSTALLER_URL__" -O "xrdp-installer-__XRDP_VER__.zip"
