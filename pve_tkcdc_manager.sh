@@ -269,13 +269,7 @@ create_vm() {
     run_on_node "$node" \
         "qm set ${vmid} --cicustom 'user=${SNIPPET_STORAGE}:snippets/${yaml_name}'"
 
-    # 10. Apply SSH key if set
-    if [[ -n "${SSH_KEY}" && -f "${SSH_KEY}" ]]; then
-        run_on_node "$node" \
-            "qm set ${vmid} --sshkeys '${SSH_KEY}'"
-    fi
-
-    # 11. Regenerate cloud-init image
+    # 10. Regenerate cloud-init image
     run_on_node "$node" "qm cloudinit update ${vmid}"
 
     log "create vm ${vmid} (${hostname}) on ${node} success"
