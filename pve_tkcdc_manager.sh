@@ -23,6 +23,12 @@ warn()   { echo -e "${YELLOW}[WARN]${NC} $*" | tee -a "$LOG_FILE"; }
 error()  { echo -e "${RED}[ERROR]${NC} $*" | tee -a "$LOG_FILE"; exit 1; }
 stage()  { echo -e "\n${BOLD}[Stage: $*]${NC}" | tee -a "$LOG_FILE"; }
 
+# ── Node IP map (populated by load_config via env.conf) ──────
+declare -A NODE_IP_MAP
+
+# ── Resolve node SSH target: IP if in NODE_IP_MAP, else name ─
+node_addr() { echo "${NODE_IP_MAP[${1}]:-${1}}"; }
+
 # ── Load configuration ───────────────────────────────────────
 load_config() {
     [[ -f "$CONFIG_FILE" ]] || error "Config file not found: $CONFIG_FILE"
@@ -47,8 +53,8 @@ run_on_node() {
     if [[ "$node" == "$EXECUTE_NODE" ]]; then
         eval "$cmd" >> "$EXEC_LOG" 2>&1
     else
-        ssh -o StrictHostKeyChecking=no -o BatchMode=yes \
-            "root@${node}" "$cmd" >> "$EXEC_LOG" 2>&1
+        ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes \
+            "root@$(node_addr "$node")" "$cmd" >> "$EXEC_LOG" 2>&1
     fi
 }
 
@@ -91,8 +97,8 @@ check_env() {
     # Check SSH connectivity to all nodes (skip EXECUTE_NODE)
     for node in "${NODE_LIST[@]}"; do
         if [[ "$node" == "$EXECUTE_NODE" ]]; then continue; fi
-        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
-            "root@${node}" "true" 2>/dev/null || \
+        ssh -n -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
+            "root@$(node_addr "$node")" "true" 2>/dev/null || \
             warn "SSH to node '${node}' failed. VMs assigned to it may fail."
     done
 
@@ -125,9 +131,9 @@ download_image() {
     for node in "${NODE_LIST[@]}"; do
         if [[ "$node" == "$EXECUTE_NODE" ]]; then continue; fi
         info "Copying image to node: $node"
-        ssh "root@${node}" "mkdir -p ${IMAGE_DIR}" 2>/dev/null || \
+        ssh -n "root@$(node_addr "$node")" "mkdir -p ${IMAGE_DIR}" 2>/dev/null || \
             { warn "SSH to $node failed, skipping image copy"; continue; }
-        scp -q "$img_path" "root@${node}:${img_path}" || \
+        scp -q "$img_path" "root@$(node_addr "$node"):${img_path}" || \
             warn "Failed to copy image to $node"
     done
 }
@@ -215,8 +221,8 @@ create_vm() {
 
     # Copy yaml to remote node if needed
     if [[ "$node" != "$EXECUTE_NODE" ]]; then
-        ssh "root@${node}" "mkdir -p ${SNIPPET_DIR}"
-        scp -q "$yaml_path" "root@${node}:${yaml_path}" || \
+        ssh -n "root@$(node_addr "$node")" "mkdir -p ${SNIPPET_DIR}"
+        scp -q "$yaml_path" "root@$(node_addr "$node"):${yaml_path}" || \
             warn "Failed to copy user-data to $node"
     fi
 
@@ -301,7 +307,7 @@ cmd_delete() {
         local yaml_path="${SNIPPET_DIR}/tkcdc-${vmid}-user.yaml"
         if [[ -f "$yaml_path" ]]; then rm -f "$yaml_path"; info "Removed $yaml_path"; fi
         if [[ "$node" != "$EXECUTE_NODE" ]]; then
-            ssh "root@${node}" "rm -f ${yaml_path} 2>/dev/null || true"
+            ssh -n "root@$(node_addr "$node")" "rm -f ${yaml_path} 2>/dev/null || true"
         fi
     done
 
@@ -334,7 +340,7 @@ cmd_status() {
     for entry in "${VM_LIST[@]}"; do
         IFS=':' read -r vmid hostname ip node <<< "$entry"
         local status
-        status=$(ssh -o BatchMode=yes -o ConnectTimeout=3 "root@${node}" \
+        status=$(ssh -n -o BatchMode=yes -o ConnectTimeout=3 "root@$(node_addr "$node")" \
             "qm status ${vmid} 2>/dev/null | awk '{print \$2}'" 2>/dev/null || echo "unknown")
         printf "  %-8s %-18s %-18s %-10s %-10s\n" \
             "$vmid" "$hostname" "$ip" "$node" "$status"
