@@ -21,7 +21,7 @@ Proxmox_tkcdc_manager/
 ### 1. 下載專案
 
 ```bash
-git clone https://github.com/yourname/Proxmox_tkcdc_manager.git
+git clone https://github.com/cooloo9871/Proxmox_tkcdc_manager.git
 cd Proxmox_tkcdc_manager
 ```
 
