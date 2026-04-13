@@ -143,17 +143,57 @@ generate_user_data() {
     local vmid="$1"
     local hostname="$2"
     local yaml_path="${SNIPPET_DIR}/tkcdc-${vmid}-user.yaml"
+    local xrdp_script="${SCRIPT_DIR}/xrdp-installer-${XRDP_INSTALLER_VERSION}.sh"
 
     [[ -f "$USER_DATA_TPL" ]] || error "Template not found: $USER_DATA_TPL"
+    [[ -f "$xrdp_script" ]] || error "xrdp installer not found: $xrdp_script"
 
     sed \
         -e "s|__VM_HOSTNAME__|${hostname}|g" \
         -e "s|__VM_USER__|${VM_USER}|g" \
         -e "s|__VM_PASSWORD__|${VM_PASSWORD}|g" \
         -e "s|__NAMESERVER__|${NAMESERVER}|g" \
-        -e "s|__XRDP_INSTALLER_URL__|${XRDP_INSTALLER_URL}|g" \
         -e "s|__XRDP_VER__|${XRDP_INSTALLER_VERSION}|g" \
         "$USER_DATA_TPL" > "$yaml_path"
+
+    # Inject xrdp installer as base64-encoded write_files entry.
+    # cloud-init will decode and write it to /tmp/xrdp-installer-<ver>.sh
+    local py_script
+    py_script=$(mktemp /tmp/inject_xrdp_XXXXXX.py)
+    cat > "$py_script" << 'PYEOF'
+import sys, base64
+
+yaml_file, script_file, ver = sys.argv[1], sys.argv[2], sys.argv[3]
+
+with open(script_file, 'rb') as f:
+    script_b64 = base64.b64encode(f.read()).decode()
+
+entry = (
+    "  - path: /tmp/xrdp-installer-%s.sh\n"
+    "    permissions: '0755'\n"
+    "    owner: root:root\n"
+    "    encoding: b64\n"
+    "    content: %s\n"
+) % (ver, script_b64)
+
+with open(yaml_file, 'r') as f:
+    content = f.read()
+
+# Insert the new write_files entry just before the package_update section
+marker = '\n# ------------------------------------------------------------\n# Package installation'
+pos = content.find(marker)
+if pos < 0:
+    marker = '\npackage_update:'
+    pos = content.find(marker)
+
+if pos >= 0:
+    content = content[:pos] + '\n' + entry + content[pos:]
+
+with open(yaml_file, 'w') as f:
+    f.write(content)
+PYEOF
+    python3 "$py_script" "$yaml_path" "$xrdp_script" "${XRDP_INSTALLER_VERSION}"
+    rm -f "$py_script"
 
     echo "$yaml_path"
 }
