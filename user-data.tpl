@@ -99,9 +99,16 @@ packages:
 runcmd:
   # ── SSH 重啟套用密碼登入設定 ────────────────────────────
   - systemctl restart ssh
+  # ── Firefox deb (via Mozilla PPA, avoids snap sandbox issues in xrdp) ──
+  - add-apt-repository -y ppa:mozillateam/ppa
+  - echo 'Package: firefox*\nPin: release o=LP-PPA-mozillateam\nPin-Priority: 501' > /etc/apt/preferences.d/mozilla-firefox
+  - apt-get install -y firefox
   # ── xrdp via local installer (injected by generate_user_data) ──
   # Script must run as a normal user (it calls sudo internally)
   - su - __VM_USER__ -c "bash /tmp/xrdp-installer.sh"
+  # Ensure xfce4 is the xrdp session (c-nergy may not detect desktop in cloud-init)
+  - echo "startxfce4" > /home/__VM_USER__/.xsessionrc
+  - chown __VM_USER__:__VM_USER__ /home/__VM_USER__/.xsessionrc
   # Apply low-encryption config
   - bash /tmp/fix-xrdp-ini.sh
   # ── podman rootless ─────────────────────────────────────────
