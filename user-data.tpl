@@ -100,8 +100,8 @@ runcmd:
   # ── SSH 重啟套用密碼登入設定 ────────────────────────────
   - systemctl restart ssh
   # ── xrdp via local installer (injected by generate_user_data) ──
-  # Run installer in non-interactive mode: option 3 = xfce
-  - echo "3" | bash /tmp/xrdp-installer.sh || true
+  # Script must run as a normal user (it calls sudo internally)
+  - su - __VM_USER__ -c "bash /tmp/xrdp-installer.sh"
   # Apply low-encryption config
   - bash /tmp/fix-xrdp-ini.sh
   # ── podman rootless ─────────────────────────────────────────
