@@ -419,20 +419,15 @@ cmd_select_storage() {
 
 # ── STATUS: show current VM state and cloud-init progress ───────
 cmd_status() {
-    # Script run inside each VM via qemu guest agent.
-    # Detects which cloud-init stage is in progress by checking installed packages.
+    # Script run inside each VM via qemu guest agent or SSH.
     local _check_script='
 status=$(cloud-init status 2>/dev/null | cut -d" " -f2)
 if [ "$status" = "done" ]; then
     echo "DONE"
 elif [ "$status" = "error" ]; then
     echo "ERROR"
-elif dpkg -l xrdp 2>/dev/null | grep -q "^ii"; then
-    echo "XRDP_DONE"
-elif dpkg -l xfce4 2>/dev/null | grep -q "^ii"; then
-    echo "PKGS_DONE"
 else
-    echo "INSTALLING"
+    echo "RUNNING"
 fi'
     local script_b64
     script_b64=$(printf '%s' "$_check_script" | base64 -w0)
@@ -501,12 +496,10 @@ except:
 
             if [[ -z "$ci_label" || "$ci_label" == "—" ]]; then
                 case "$ga_out" in
-                    DONE)        ci_label="Ready" ;;
-                    ERROR)       ci_label="Error (see /var/log/cloud-init-output.log)" ;;
-                    XRDP_DONE)   ci_label="Finalizing setup..." ;;
-                    PKGS_DONE)   ci_label="Installing xrdp..." ;;
-                    INSTALLING)  ci_label="Installing packages..." ;;
-                    *)           ci_label="Waiting..." ;;
+                    DONE)    ci_label="Ready" ;;
+                    ERROR)   ci_label="Error" ;;
+                    RUNNING) ci_label="Waiting..." ;;
+                    *)       ci_label="Waiting..." ;;
                 esac
             fi
         fi
@@ -514,10 +507,8 @@ except:
         # ── Colorize ────────────────────────────────────────────
         local color="$NC"
         case "$ci_label" in
-            Ready)                    color="$GREEN"  ;;
-            Error*)                   color="$RED"    ;;
-            Booting*|Waiting*)        color="$NC"     ;;
-            *)                        color="$YELLOW" ;;
+            Ready)   color="$GREEN" ;;
+            Error)   color="$RED"   ;;
         esac
 
         printf "  %-8s %-18s %-18s %-10s %-10s " \

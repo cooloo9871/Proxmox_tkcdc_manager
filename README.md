@@ -29,7 +29,7 @@
 - **全自動初始化**：cloud-init 首次開機完成所有軟體安裝與設定，無需人工介入
 - **xRDP 遠端桌面**：整合 xfce4 桌面環境，支援 Windows RDP 客戶端直接連線
 - **繁體中文輸入**：自動設定 IBus + 注音輸入法，開機即可在 Firefox 輸入中文
-- **Podman rootless container**：不需 root 權限即可執行 container
+- **Podman rootless container**：不需 root 權限即可執行 container，適合在 container 內建置 k8s 環境
 - **效能優化**：xRDP 低延遲調校 + kernel 參數針對 xRDP 與 container 工作負載調整
 - **VM 狀態追蹤**：`status` 指令即時顯示每台 VM 的 cloud-init 安裝進度
 
@@ -201,14 +201,12 @@ bash pve_tkcdc_manager.sh start
 bash pve_tkcdc_manager.sh status
 ```
 
-首次開機 cloud-init 需要約 **5～15 分鐘**（視網路速度），狀態欄位會依序顯示：
+首次開機 cloud-init 需要約 **5～15 分鐘**（視網路速度），狀態欄位會顯示：
 
 | 狀態 | 說明 |
 |------|------|
 | `Booting...` | VM 開機中，SSH 尚未就緒 |
-| `Installing packages...` | 正在安裝套件（xfce4、podman 等） |
-| `Installing xrdp...` | 套件完成，正在安裝 xRDP |
-| `Finalizing setup...` | xRDP 安裝完成，執行最後設定 |
+| `Waiting...` | cloud-init 執行中 |
 | `Ready` | cloud-init 全部完成，可連線 |
 | `Error` | cloud-init 發生錯誤，見 VM 內 log |
 
