@@ -238,18 +238,19 @@ write_files:
     permissions: '0644'
     owner: root:root
     content: |
-      # Guard against double-sourcing (login shell sources /etc/profile.d/,
-      # then ~/.bashrc sources this file again → PATH would be duplicated)
-      [ -n "$_TKCDC_ENV_LOADED" ] && return 0
-      export _TKCDC_ENV_LOADED=1
-
       gw=$(route -n | grep -e "^0.0.0.0 ")
       export GWIF=${gw##* }
       ips=$(ifconfig $GWIF | grep 'inet ')
       export IP=$(echo $ips | cut -d' ' -f2 | cut -d':' -f2)
       export NETID=${IP%.*}
       export GW=$(route -n | grep -e '^0.0.0.0' | tr -s \ - | cut -d ' ' -f2)
-      export PATH="$HOME/bin:$HOME/tk/bin:$HOME/kind/bin:$PATH"
+      # Only prepend custom paths not already in PATH.
+      # $HOME/bin is intentionally excluded — ~/.profile already adds it unconditionally,
+      # so including it here would cause duplication in xRDP sessions.
+      case ":$PATH:" in
+        *":$HOME/tk/bin:"*) ;;
+        *) export PATH="$HOME/tk/bin:$HOME/kind/bin:$PATH" ;;
+      esac
 
       if [ ! -d $HOME/.kube ]; then
          mkdir $HOME/.kube
@@ -289,7 +290,7 @@ write_files:
       alias pc='sudo podman system prune -a -f; sudo podman volume rm -a -f'
       alias vms='sudo /usr/bin/vmware-toolbox-cmd disk shrink /'
       source /usr/share/bash-completion/bash_completion
-      source <(kubectl completion bash)
+      command -v kubectl &>/dev/null && source <(kubectl completion bash) || true
 
   # Podman rootless setup script (runs as VM_USER)
   - path: /tmp/setup-podman-rootless.sh
