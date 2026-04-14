@@ -184,6 +184,108 @@ write_files:
         '</channel>' > "${XFCE_DIR}/xfwm4.xml"
       chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config"
 
+  # k8s toolchain + taroko package installer
+  - path: /tmp/setup-tools.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      USERNAME="__VM_USER__"
+      HOME_DIR="/home/${USERNAME}"
+
+      # ── CNI plugins ─────────────────────────────────────────────
+      echo "[setup-tools] Installing CNI plugins..."
+      rm -rf "${HOME_DIR}/cni"
+      mkdir -p "${HOME_DIR}/cni"
+      CNI_URL=$(curl -sL https://api.github.com/repos/containernetworking/plugins/releases/latest | \
+          jq -r '.assets[].browser_download_url' | grep 'linux-amd64.*.tgz$')
+      curl -sL "$CNI_URL" -o /tmp/cni-plugins.tgz
+      tar xf /tmp/cni-plugins.tgz -C "${HOME_DIR}/cni"
+      rm -f /tmp/cni-plugins.tgz
+      chown -R "${USERNAME}:${USERNAME}" "${HOME_DIR}/cni"
+
+      # ── kubectl ──────────────────────────────────────────────────
+      echo "[setup-tools] Installing kubectl..."
+      K8S_VER=$(curl -sL https://dl.k8s.io/release/stable.txt)
+      curl -sL "https://dl.k8s.io/release/${K8S_VER}/bin/linux/amd64/kubectl" -o /tmp/kubectl
+      chmod +x /tmp/kubectl
+      mv /tmp/kubectl /usr/local/bin/kubectl
+
+      # ── cilium CLI ───────────────────────────────────────────────
+      echo "[setup-tools] Installing cilium CLI..."
+      curl -sL https://github.com/cilium/cilium-cli/releases/latest/download/cilium-linux-amd64.tar.gz \
+          -o /tmp/cilium.tar.gz
+      tar xzf /tmp/cilium.tar.gz -C /usr/local/bin cilium
+      rm -f /tmp/cilium.tar.gz
+
+      # ── taroko package ───────────────────────────────────────────
+      echo "[setup-tools] Downloading taroko package..."
+      rm -rf "${HOME_DIR}/tk"
+      curl -sL http://www.oc99.org/zip/tk2026v1.0.zip -o /tmp/tk2026v1.0.zip
+      unzip -q /tmp/tk2026v1.0.zip -d "${HOME_DIR}"
+      rm -f /tmp/tk2026v1.0.zip
+      chown -R "${USERNAME}:${USERNAME}" "${HOME_DIR}/tk"
+
+      # ── .kube config ─────────────────────────────────────────────
+      mkdir -p "${HOME_DIR}/.kube"
+      touch "${HOME_DIR}/.kube/config"
+      chown -R "${USERNAME}:${USERNAME}" "${HOME_DIR}/.kube"
+
+      echo "[setup-tools] Done."
+
+  # /etc/profile.d/tkcdc.sh — shell environment for all login sessions
+  - path: /etc/profile.d/tkcdc.sh
+    permissions: '0644'
+    owner: root:root
+    content: |
+      gw=$(route -n | grep -e "^0.0.0.0 ")
+      export GWIF=${gw##* }
+      ips=$(ifconfig $GWIF | grep 'inet ')
+      export IP=$(echo $ips | cut -d' ' -f2 | cut -d':' -f2)
+      export NETID=${IP%.*}
+      export GW=$(route -n | grep -e '^0.0.0.0' | tr -s \ - | cut -d ' ' -f2)
+      export PATH="$HOME/bin:$HOME/tk/bin:$HOME/kind/bin:$PATH"
+
+      if [ ! -d $HOME/.kube ]; then
+         mkdir $HOME/.kube
+         touch $HOME/.kube/config
+      fi
+
+      export PROXY=""
+      if [ "$PROXY" != "" ]; then
+         export http_proxy="http://$PROXY:3128"
+         export https_proxy="http://$PROXY:3128"
+         export no_proxy="localhost,127.0.0.1,10.0.0.0/8"
+
+         echo 'Acquire::http::Proxy "http://$PROXY:3128";' | sudo tee /etc/apt/apt.conf
+         echo 'Acquire::https::Proxy "http://$PROXY:3128";' | sudo tee -a /etc/apt/apt.conf
+      fi
+
+      echo "Welcome to Ubuntu 24.04 : $IP"
+      echo ""
+
+      export NOW="--force --grace-period 0"
+      export KUBE_EDITOR="nano"
+      export TZ=Asia/Taipei
+      export PS1='[$(grep "  cluster" ~/.kube/config|cut -d ":" -f 2 |tr -d " ")]\u@\h:\w$ '
+      alias ksc='source tk/bin/ksc'
+      alias ping='ping -c 4 '
+      alias pingdup='sudo arping -D -I eth0 -c 2 '
+      alias dir='ls -alh '
+      alias poweroff='sudo poweroff; sleep 5'
+      alias reboot='sudo reboot; sleep 5'
+      alias kg='kubectl get'
+      alias k='kubectl'
+      alias ka='kubectl apply'
+      alias kd='kubectl delete'
+      alias kc='kubectl create'
+      alias ks='kubectl get pods -n kube-system'
+      alias docker='sudo podman'
+      alias pc='sudo podman system prune -a -f; sudo podman volume rm -a -f'
+      alias vms='sudo /usr/bin/vmware-toolbox-cmd disk shrink /'
+      source /usr/share/bash-completion/bash_completion
+      source <(kubectl completion bash)
+
   # Podman rootless setup script (runs as VM_USER)
   - path: /tmp/setup-podman-rootless.sh
     permissions: '0755'
@@ -225,6 +327,7 @@ packages:
   - ibus
   - ibus-chewing
   - fonts-noto-cjk
+  - jq
 
 # ------------------------------------------------------------
 # Run commands at first boot
@@ -250,6 +353,9 @@ runcmd:
   - echo 'export DESKTOP_SESSION=xfce' >> /home/__VM_USER__/.profile
   # Remove .xsessionrc so it doesn't block the Xsession.d pipeline at step 40
   - rm -f /home/__VM_USER__/.xsessionrc
+  # xfce4-terminal opens a non-login shell (reads ~/.bashrc, not /etc/profile.d/).
+  # Source tkcdc.sh from ~/.bashrc so env/aliases are available in every terminal.
+  - echo '[ -f /etc/profile.d/tkcdc.sh ] && source /etc/profile.d/tkcdc.sh' >> /home/__VM_USER__/.bashrc
   # Apply xrdp performance config (low-crypto, TCP buffers)
   - bash /tmp/fix-xrdp-ini.sh
   # Disable Xfce4 compositor before first login
@@ -261,11 +367,13 @@ runcmd:
   - apt-get install -y firefox
   # ── podman rootless ─────────────────────────────────────────
   - bash /tmp/setup-podman-rootless.sh
+  # ── k8s tools (CNI / kubectl / cilium) + taroko package ────
+  - bash /tmp/setup-tools.sh
   # ── Start qemu-guest-agent (installed via packages above, but udev event ──
   # already fired before install, so re-trigger to activate the service)
   - udevadm trigger --subsystem-match=virtio-ports
   # ── Cleanup ─────────────────────────────────────────────────
-  - rm -f /tmp/xrdp-installer.sh /tmp/fix-xrdp-ini.sh /tmp/setup-xfce4-perf.sh /tmp/setup-ibus.sh /tmp/setup-podman-rootless.sh
+  - rm -f /tmp/xrdp-installer.sh /tmp/fix-xrdp-ini.sh /tmp/setup-xfce4-perf.sh /tmp/setup-ibus.sh /tmp/setup-podman-rootless.sh /tmp/setup-tools.sh
 
 final_message: |
   tkcdc VM __VM_HOSTNAME__ is ready.
