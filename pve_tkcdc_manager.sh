@@ -103,13 +103,51 @@ check_env() {
     done
 
     # Check snippet dir
-    mkdir -p "$SNIPPET_DIR"
+    mkdir -p "/var/lib/vz/snippets"
 
     # Validate storage exists on EXECUTE_NODE
     pvesm status | awk '{print $1}' | grep -qx "$STORAGE" || \
         warn "Storage '${STORAGE}' not found on ${EXECUTE_NODE}. Check env.conf."
 
     log "Check Environment Success"
+}
+
+# ── Pre-flight: detect VMID and IP conflicts before any VM is created ──
+check_conflicts() {
+    stage "Conflict Check (VMID & IP)"
+
+    local conflicts=0
+
+    for entry in "${VM_LIST[@]}"; do
+        IFS=':' read -r vmid hostname ip node <<< "$entry"
+
+        # ── VMID conflict: ask each node if the VMID already exists ──
+        local vmid_exists=false
+        if [[ "$node" == "$EXECUTE_NODE" ]]; then
+            qm status "$vmid" &>/dev/null && vmid_exists=true || true
+        else
+            ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
+                "root@$(node_addr "$node")" \
+                "qm status ${vmid}" &>/dev/null && vmid_exists=true || true
+        fi
+
+        if $vmid_exists; then
+            warn "VMID ${vmid} (${hostname}) already exists on node [${node}]"
+            conflicts=$(( conflicts + 1 ))
+        fi
+
+        # ── IP conflict: ping to see if anything already holds this IP ──
+        if ping -c 1 -W 1 "$ip" &>/dev/null; then
+            warn "IP ${ip} (${hostname}) is already in use on the network"
+            conflicts=$(( conflicts + 1 ))
+        fi
+    done
+
+    if [[ $conflicts -gt 0 ]]; then
+        error "Found ${conflicts} conflict(s). Resolve them or adjust VMID_START / VM_IP_START in env.conf before retrying."
+    fi
+
+    log "No conflicts found — all VMIDs and IPs are free"
 }
 
 # ── Download Ubuntu cloud image (once) ───────────────────────
@@ -131,7 +169,8 @@ download_image() {
     for node in "${NODE_LIST[@]}"; do
         if [[ "$node" == "$EXECUTE_NODE" ]]; then continue; fi
         info "Copying image to node: $node"
-        ssh -n "root@$(node_addr "$node")" "mkdir -p ${IMAGE_DIR}" 2>/dev/null || \
+        ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10 \
+            "root@$(node_addr "$node")" "mkdir -p ${IMAGE_DIR}" 2>/dev/null || \
             { warn "SSH to $node failed, skipping image copy"; continue; }
         scp -q -o StrictHostKeyChecking=no "$img_path" "root@$(node_addr "$node"):${img_path}" || \
             warn "Failed to copy image to $node"
@@ -142,7 +181,7 @@ download_image() {
 generate_user_data() {
     local vmid="$1"
     local hostname="$2"
-    local yaml_path="${SNIPPET_DIR}/tkcdc-${vmid}-user.yaml"
+    local yaml_path="/var/lib/vz/snippets/tkcdc-${vmid}-user.yaml"
     local xrdp_scripts=( "${SCRIPT_DIR}"/xrdp-installer-*.sh )
     [[ -f "${xrdp_scripts[0]}" ]] || error "No xrdp-installer-*.sh found in ${SCRIPT_DIR}"
     [[ ${#xrdp_scripts[@]} -gt 1 ]] && warn "Multiple xrdp installers found, using: ${xrdp_scripts[0]}"
@@ -150,23 +189,31 @@ generate_user_data() {
 
     [[ -f "$USER_DATA_TPL" ]] || error "Template not found: $USER_DATA_TPL"
 
-    sed \
-        -e "s|__VM_HOSTNAME__|${hostname}|g" \
-        -e "s|__VM_USER__|${VM_USER}|g" \
-        -e "s|__VM_PASSWORD__|${VM_PASSWORD}|g" \
-        -e "s|__NAMESERVER__|${NAMESERVER}|g" \
-        "$USER_DATA_TPL" > "$yaml_path"
-
-    # Inject xrdp installer as base64-encoded write_files entry.
-    # cloud-init will decode and write it to /tmp/xrdp-installer-<ver>.sh
+    # Use Python for all substitution + xrdp injection in one pass.
+    # Python str.replace() handles any special characters in values (|, /, &, etc.)
+    # that would break sed delimiter-based substitution.
     local py_script
     py_script=$(mktemp /tmp/inject_xrdp_XXXXXX.py)
     trap "rm -f '${py_script}'" RETURN
     cat > "$py_script" << 'PYEOF'
 import sys, base64
 
-yaml_file, script_file = sys.argv[1], sys.argv[2]
+tpl_file, yaml_file, script_file, vm_hostname, vm_user, vm_password, nameserver = sys.argv[1:8]
 
+# Read template and do variable substitution (handles any special chars)
+with open(tpl_file, 'r') as f:
+    content = f.read()
+
+for key, val in {
+    '__VM_HOSTNAME__': vm_hostname,
+    '__VM_USER__':     vm_user,
+    '__VM_PASSWORD__': vm_password,
+    '__NAMESERVER__':  nameserver,
+}.items():
+    content = content.replace(key, val)
+
+# Inject xrdp installer as base64-encoded write_files entry.
+# cloud-init will decode and write it to /tmp/xrdp-installer.sh
 with open(script_file, 'rb') as f:
     script_b64 = base64.b64encode(f.read()).decode()
 
@@ -177,9 +224,6 @@ entry = (
     "    encoding: b64\n"
     "    content: %s\n"
 ) % script_b64
-
-with open(yaml_file, 'r') as f:
-    content = f.read()
 
 # Insert the new write_files entry just before the package_update section
 marker = '\n# ------------------------------------------------------------\n# Package installation'
@@ -194,7 +238,8 @@ if pos >= 0:
 with open(yaml_file, 'w') as f:
     f.write(content)
 PYEOF
-    python3 "$py_script" "$yaml_path" "$xrdp_script"
+    python3 "$py_script" "$USER_DATA_TPL" "$yaml_path" "$xrdp_script" \
+        "$hostname" "$VM_USER" "$VM_PASSWORD" "$NAMESERVER"
 
     echo "$yaml_path"
 }
@@ -223,7 +268,7 @@ create_vm() {
 
     # 2. Import disk
     run_on_node "$node" \
-        "qm importdisk ${vmid} '${img_path}' ${STORAGE} --format qcow2"
+        "qm importdisk ${vmid} '${img_path}' ${STORAGE}"
 
     # 3. Attach disk with virtio-scsi
     run_on_node "$node" \
@@ -262,13 +307,13 @@ create_vm() {
 
     # Copy yaml to remote node if needed
     if [[ "$node" != "$EXECUTE_NODE" ]]; then
-        ssh -n -o StrictHostKeyChecking=no "root@$(node_addr "$node")" "mkdir -p ${SNIPPET_DIR}"
-        scp -q -o StrictHostKeyChecking=no "$yaml_path" "root@$(node_addr "$node"):${yaml_path}" || \
+        ssh -n -o StrictHostKeyChecking=no "root@$(node_addr "$node")" "mkdir -p /var/lib/vz/snippets"
+        scp -q -o StrictHostKeyChecking=no "$yaml_path" "root@$(node_addr "$node"):/var/lib/vz/snippets/$(basename "$yaml_path")" || \
             warn "Failed to copy user-data to $node"
     fi
 
     run_on_node "$node" \
-        "qm set ${vmid} --cicustom 'user=${SNIPPET_STORAGE}:snippets/${yaml_name}'"
+        "qm set ${vmid} --cicustom 'user=local:snippets/${yaml_name}'"
 
     # 10. Regenerate cloud-init image
     run_on_node "$node" "qm cloudinit update ${vmid}"
@@ -279,6 +324,7 @@ create_vm() {
 # ── CREATE all VMs ─────────────────────────────────────────────
 cmd_create() {
     check_env
+    check_conflicts
     download_image
 
     stage "Create VMs"
@@ -343,10 +389,11 @@ cmd_delete() {
             warn "Failed to delete vm ${vmid}"
 
         # Remove cloud-init yaml
-        local yaml_path="${SNIPPET_DIR}/tkcdc-${vmid}-user.yaml"
+        local yaml_path="/var/lib/vz/snippets/tkcdc-${vmid}-user.yaml"
         if [[ -f "$yaml_path" ]]; then rm -f "$yaml_path"; info "Removed $yaml_path"; fi
         if [[ "$node" != "$EXECUTE_NODE" ]]; then
-            ssh -n "root@$(node_addr "$node")" "rm -f ${yaml_path} 2>/dev/null || true"
+            ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes \
+                "root@$(node_addr "$node")" "rm -f ${yaml_path} 2>/dev/null || true"
         fi
     done
 
@@ -501,8 +548,10 @@ Edit ${CYAN}env.conf${NC} to change VM count, specs, IPs, nodes, and storage.
 
 # ── Entrypoint ────────────────────────────────────────────────
 main() {
-    : > "$LOG_FILE"
-    : > "$EXEC_LOG"
+    # Truncate logs only for state-changing commands, not for status/select-storage
+    case "${1:-}" in
+        create|start|stop|delete) : > "$LOG_FILE"; : > "$EXEC_LOG" ;;
+    esac
 
     load_config
     build_vm_list
