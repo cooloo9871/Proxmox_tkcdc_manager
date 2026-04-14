@@ -238,6 +238,11 @@ write_files:
     permissions: '0644'
     owner: root:root
     content: |
+      # Guard against double-sourcing (login shell sources /etc/profile.d/,
+      # then ~/.bashrc sources this file again → PATH would be duplicated)
+      [ -n "$_TKCDC_ENV_LOADED" ] && return 0
+      export _TKCDC_ENV_LOADED=1
+
       gw=$(route -n | grep -e "^0.0.0.0 ")
       export GWIF=${gw##* }
       ips=$(ifconfig $GWIF | grep 'inet ')
