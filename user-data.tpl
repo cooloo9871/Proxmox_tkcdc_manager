@@ -231,6 +231,14 @@ write_files:
       touch "${HOME_DIR}/.kube/config"
       chown -R "${USERNAME}:${USERNAME}" "${HOME_DIR}/.kube"
 
+      # ── taroko k8s auto-setup ────────────────────────────────────
+      if [ "__ENABLE_TK8S__" = "true" ]; then
+          echo "[setup-tools] Starting taroko k8s (kto tk8s)..."
+          su - "$USERNAME" -c "bash --login -c 'kto tk8s'" && \
+              echo "[setup-tools] kto tk8s completed." || \
+              echo "[setup-tools] kto tk8s failed — check ~/tk logs."
+      fi
+
       echo "[setup-tools] Done."
 
   # /etc/profile.d/tkcdc.sh — shell environment for all login sessions

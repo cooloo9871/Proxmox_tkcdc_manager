@@ -198,17 +198,18 @@ generate_user_data() {
     cat > "$py_script" << 'PYEOF'
 import sys, base64
 
-tpl_file, yaml_file, script_file, vm_hostname, vm_user, vm_password, nameserver = sys.argv[1:8]
+tpl_file, yaml_file, script_file, vm_hostname, vm_user, vm_password, nameserver, enable_tk8s = sys.argv[1:9]
 
 # Read template and do variable substitution (handles any special chars)
 with open(tpl_file, 'r') as f:
     content = f.read()
 
 for key, val in {
-    '__VM_HOSTNAME__': vm_hostname,
-    '__VM_USER__':     vm_user,
-    '__VM_PASSWORD__': vm_password,
-    '__NAMESERVER__':  nameserver,
+    '__VM_HOSTNAME__':  vm_hostname,
+    '__VM_USER__':      vm_user,
+    '__VM_PASSWORD__':  vm_password,
+    '__NAMESERVER__':   nameserver,
+    '__ENABLE_TK8S__':  enable_tk8s,
 }.items():
     content = content.replace(key, val)
 
@@ -239,7 +240,7 @@ with open(yaml_file, 'w') as f:
     f.write(content)
 PYEOF
     python3 "$py_script" "$USER_DATA_TPL" "$yaml_path" "$xrdp_script" \
-        "$hostname" "$VM_USER" "$VM_PASSWORD" "$NAMESERVER"
+        "$hostname" "$VM_USER" "$VM_PASSWORD" "$NAMESERVER" "${ENABLE_TK8S:-false}"
 
     echo "$yaml_path"
 }
