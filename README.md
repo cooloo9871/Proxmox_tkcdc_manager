@@ -1,7 +1,7 @@
 # Proxmox tkcdc Manager
 
 在 Proxmox VE 叢集上，自動化批次部署 Ubuntu 24.04 VM 的管理工具。  
-每台 VM 開機後透過 cloud-init 自動完成完整環境建置，包含 xRDP 遠端桌面、繁體中文輸入、Firefox 瀏覽器、Podman rootless container 環境，以及針對 xRDP 與 container 工作負載優化的 kernel 參數。
+每台 VM 開機後透過 cloud-init 自動完成完整環境建置，包含 xRDP 遠端桌面、繁體中文輸入、Firefox 瀏覽器、Podman rootless container 環境、k8s 工具鏈（CNI / kubectl / cilium）、taroko 套件，以及針對 xRDP 與 container 工作負載優化的 kernel 參數。
 
 ---
 
@@ -18,6 +18,7 @@
 - [VM 環境說明](#vm-環境說明)
 - [Kernel 參數優化](#kernel-參數優化)
 - [常見問題排查](#常見問題排查)
+- [注意事項](#注意事項)
 
 ---
 
@@ -30,6 +31,9 @@
 - **xRDP 遠端桌面**：整合 xfce4 桌面環境，支援 Windows RDP 客戶端直接連線
 - **繁體中文輸入**：自動設定 IBus + 注音輸入法，開機即可在 Firefox 輸入中文
 - **Podman rootless container**：不需 root 權限即可執行 container，適合在 container 內建置 k8s 環境
+- **k8s 工具鏈**：自動安裝 CNI plugins、kubectl、cilium CLI 及 taroko 套件至使用者家目錄
+- **taroko k8s 自動啟用**：`ENABLE_TK8S=true` 時，VM 首次開機即自動執行 `kto tk8s` 初始化 k8s 環境
+- **Shell 環境預設**：登入即具備完整 kubectl alias、IP/GW 環境變數、注音切換等開發工具設定
 - **效能優化**：xRDP 低延遲調校 + kernel 參數針對 xRDP 與 container 工作負載調整
 - **VM 狀態追蹤**：`status` 指令即時顯示每台 VM 的 cloud-init 安裝進度
 
@@ -163,6 +167,21 @@ export VM_PASSWORD="bigred"
 ```
 
 > 此帳號會在 VM 內建立，具備 sudo 免密碼權限，並作為 xRDP 登入帳號。
+
+### Taroko k8s 自動啟用
+
+```bash
+export ENABLE_TK8S="false"   # 改為 "true" 可在首次開機自動初始化 k8s 環境
+```
+
+設為 `true` 後，cloud-init 完成 taroko 套件安裝後會自動以 `VM_USER` 身份執行：
+
+```bash
+bash --login -c 'kto tk8s'
+```
+
+`bash --login` 確保 `~/tk/bin` 已在 PATH 中，`kto` 指令才能正常找到。  
+執行結果記錄於 `/var/log/cloud-init-output.log`。
 
 ---
 
@@ -310,6 +329,7 @@ systemctl disable --now ufw
 | `dbus-user-session` / `slirp4netns` / `uidmap` | Podman rootless 相依套件 |
 | `qemu-guest-agent` | PVE 虛擬機代理程式 |
 | `curl` / `wget` / `unzip` / `net-tools` | 常用工具 |
+| `jq` | JSON 解析（CNI plugins 下載時解析 GitHub API） |
 
 ### 5. xRDP 安裝與設定
 
@@ -365,6 +385,33 @@ udevadm trigger --subsystem-match=virtio-ports
 
 > qemu-guest-agent 的 udev 事件在開機時就已觸發，但當時套件尚未安裝；安裝完成後需手動重觸發，服務才能正確啟動。
 
+### 11. k8s 工具鏈 + taroko 套件安裝
+
+以 root 身份執行 `/tmp/setup-tools.sh`，依序完成：
+
+| 項目 | 安裝位置 | 說明 |
+|------|----------|------|
+| CNI plugins | `~/cni/` | 透過 GitHub API 自動取得最新版 |
+| kubectl | `/usr/local/bin/kubectl` | 自動取得 stable 版本 |
+| cilium CLI | `/usr/local/bin/cilium` | Cilium CNI 管理工具 |
+| taroko 套件 | `~/tk/` | `tk2026v1.0.zip` 解壓至家目錄 |
+| `~/.kube/config` | `~/.kube/config` | 初始化空白 kubeconfig |
+
+若 `ENABLE_TK8S=true`，安裝完成後自動執行 `kto tk8s` 初始化 taroko k8s 環境。
+
+### 12. Shell 環境設定
+
+寫入 `/etc/profile.d/tkcdc.sh`，並在 `~/.bashrc` 加入 source，確保 xRDP 開啟的 terminal 也能載入：
+
+| 設定項目 | 內容 |
+|----------|------|
+| 網路環境變數 | `$IP`、`$GW`、`$GWIF`、`$NETID`（每次登入自動偵測） |
+| PATH | 加入 `~/tk/bin`、`~/kind/bin` |
+| kubectl alias | `k`、`kg`、`ka`、`kd`、`kc`、`ks` |
+| 常用 alias | `docker`（→ podman）、`ping`、`dir`、`poweroff`、`reboot` 等 |
+| kubectl completion | bash tab 補全自動啟用 |
+| PS1 | 顯示目前 kubeconfig cluster 名稱 |
+
 ---
 
 ## VM 環境說明
@@ -396,12 +443,25 @@ podman info | grep -E "rootless|cgroupVersion"
 
 # 執行測試 container
 podman run --rm hello-world
+```
 
-# 以 container 執行 k8s（使用 kind 或 k3s-in-container）
-podman run -d --name k3s \
-  --privileged \
-  -p 6443:6443 \
-  rancher/k3s server
+### k8s 工具
+
+| 工具 | 路徑 | 說明 |
+|------|------|------|
+| CNI plugins | `~/cni/` | bridge、loopback、host-local 等標準 CNI 插件 |
+| kubectl | `/usr/local/bin/kubectl` | Kubernetes CLI |
+| cilium CLI | `/usr/local/bin/cilium` | Cilium CNI 安裝與狀態管理 |
+| taroko 套件 | `~/tk/` | taroko k8s 工具集，含 `kto`、`ksc` 等指令 |
+
+```bash
+# 確認工具版本
+~/cni/bridge --version
+kubectl version --client
+cilium version --client
+
+# taroko k8s 初始化（若未設 ENABLE_TK8S=true 自動執行）
+kto tk8s
 ```
 
 ---
@@ -541,6 +601,23 @@ sudo systemctl start qemu-guest-agent
 ```bash
 # 安裝 sshpass 啟用 SSH 備援機制
 apt-get install -y sshpass
+```
+
+### Taroko k8s 初始化問題
+
+```bash
+# 確認 kto 指令可執行
+which kto
+kto --version 2>/dev/null || ls ~/tk/bin/
+
+# 確認 taroko 套件已解壓
+ls ~/tk/bin/
+
+# 手動執行 k8s 初始化
+bash --login -c 'kto tk8s'
+
+# 查看初始化 log（cloud-init 執行時的輸出）
+sudo grep -A5 "kto tk8s" /var/log/cloud-init-output.log
 ```
 
 ### 多節點 SSH 金鑰問題
