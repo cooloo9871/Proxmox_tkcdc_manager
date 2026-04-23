@@ -121,18 +121,25 @@ check_conflicts() {
     for entry in "${VM_LIST[@]}"; do
         IFS=':' read -r vmid hostname ip node <<< "$entry"
 
-        # ── VMID conflict: ask each node if the VMID already exists ──
+        # ── VMID conflict: scan ALL nodes (not just assigned one) ──
         local vmid_exists=false
-        if [[ "$node" == "$EXECUTE_NODE" ]]; then
-            qm status "$vmid" &>/dev/null && vmid_exists=true || true
-        else
-            ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
-                "root@$(node_addr "$node")" \
-                "qm status ${vmid}" &>/dev/null && vmid_exists=true || true
-        fi
+        local found_on=""
+        for check_node in "${NODE_LIST[@]}"; do
+            if [[ "$check_node" == "$EXECUTE_NODE" ]]; then
+                if qm status "$vmid" &>/dev/null; then
+                    vmid_exists=true; found_on="$check_node"; break
+                fi
+            else
+                if ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
+                    "root@$(node_addr "$check_node")" \
+                    "qm status ${vmid}" &>/dev/null; then
+                    vmid_exists=true; found_on="$check_node"; break
+                fi
+            fi
+        done
 
         if $vmid_exists; then
-            warn "VMID ${vmid} (${hostname}) already exists on node [${node}]"
+            warn "VMID ${vmid} (${hostname}) already exists on node [${found_on}]"
             conflicts=$(( conflicts + 1 ))
         fi
 
