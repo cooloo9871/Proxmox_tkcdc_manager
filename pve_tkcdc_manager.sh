@@ -256,7 +256,7 @@ create_vm() {
     info "Creating VM ${vmid} (${hostname}) on node [${node}] @ ${VM_NET_PREFIX}.x → ${ip}"
 
     # 1. Create base VM
-    run_on_node "$node" \
+    if ! run_on_node "$node" \
         "qm create ${vmid} \
             --name '${hostname}' \
             --memory ${MEM} \
@@ -265,7 +265,20 @@ create_vm() {
             --cpu ${CPU_TYPE} \
             --net0 virtio,bridge=${BRIDGE} \
             --ostype l26 \
-            --agent enabled=1"
+            --agent enabled=1"; then
+        local _dup=false
+        if [[ "$node" == "$EXECUTE_NODE" ]]; then
+            qm status "$vmid" &>/dev/null && _dup=true || true
+        else
+            ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
+                "root@$(node_addr "$node")" "qm status ${vmid}" &>/dev/null && _dup=true || true
+        fi
+        if $_dup; then
+            error "VMID ${vmid} already exists on node [${node}]. Delete it first or adjust VMID range in env.conf."
+        else
+            error "Failed to create VM ${vmid} on node [${node}]. See ${EXEC_LOG} for details."
+        fi
+    fi
 
     # 2. Import disk
     run_on_node "$node" \
@@ -317,7 +330,7 @@ create_vm() {
         "qm set ${vmid} --cicustom 'user=local:snippets/${yaml_name}'"
 
     # 10. Regenerate cloud-init image
-    run_on_node "$node" "qm cloudinit update ${vmid}"
+    run_on_node "$node" "qm cloudinit update ${vmid} || true"
 
     log "create vm ${vmid} (${hostname}) on ${node} success"
 }
@@ -383,11 +396,22 @@ cmd_delete() {
     for entry in "${VM_LIST[@]}"; do
         IFS=':' read -r vmid hostname ip node <<< "$entry"
         info "Deleting VM ${vmid} (${hostname}) on ${node}"
-        # Stop first (ignore error if already stopped)
-        run_on_node "$node" "qm stop ${vmid} 2>/dev/null || true"
-        run_on_node "$node" "qm destroy ${vmid} --purge 2>/dev/null" && \
-            log "delete vm ${vmid} completed" || \
-            warn "Failed to delete vm ${vmid}"
+        # Check if VM exists before attempting delete
+        local _exists=false
+        if [[ "$node" == "$EXECUTE_NODE" ]]; then
+            qm status "$vmid" &>/dev/null && _exists=true || true
+        else
+            ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
+                "root@$(node_addr "$node")" "qm status ${vmid}" &>/dev/null && _exists=true || true
+        fi
+        if ! $_exists; then
+            warn "VM ${vmid} (${hostname}) not found on node [${node}], skipping delete"
+        else
+            run_on_node "$node" "qm stop ${vmid} 2>/dev/null || true"
+            run_on_node "$node" "qm destroy ${vmid} --purge" && \
+                log "delete vm ${vmid} completed" || \
+                warn "Failed to delete vm ${vmid}"
+        fi
 
         # Remove cloud-init yaml
         local yaml_path="/var/lib/vz/snippets/tkcdc-${vmid}-user.yaml"
