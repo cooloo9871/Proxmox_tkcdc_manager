@@ -26,8 +26,49 @@ stage()  { echo -e "\n${BOLD}[Stage: $*]${NC}" | tee -a "$LOG_FILE"; }
 # ── Node IP map (populated by load_config via env.conf) ──────
 declare -A NODE_IP_MAP
 
+# ── VM location cache: VMID → actual node (filled by load_vm_locations) ─
+declare -A _VM_NODE_CACHE
+
 # ── Resolve node SSH target: IP if in NODE_IP_MAP, else name ─
 node_addr() { echo "${NODE_IP_MAP[${1}]:-${1}}"; }
+
+# ── Query PVE cluster for real-time VM→node mapping ─────────
+load_vm_locations() {
+    local json
+    json=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null) || return 0
+    while IFS=$'\t' read -r vmid node; do
+        [[ -n "$vmid" && -n "$node" ]] && _VM_NODE_CACHE["$vmid"]="$node"
+    done < <(python3 -c "
+import sys, json
+for vm in json.loads(sys.stdin.read()):
+    vmid = str(vm.get('vmid',''))
+    node = vm.get('node','')
+    if vmid and node:
+        print(vmid + '\t' + node)
+" <<< "$json" 2>/dev/null)
+}
+
+# ── Find the node currently hosting a VM ─────────────────────
+# Uses cluster cache first; falls back to probing each node via SSH.
+find_vm_node() {
+    local vmid="$1"
+    if [[ -v _VM_NODE_CACHE["$vmid"] ]]; then
+        echo "${_VM_NODE_CACHE[$vmid]}"
+        return 0
+    fi
+    local n
+    for n in "${NODE_LIST[@]}"; do
+        if [[ "$n" == "$EXECUTE_NODE" ]]; then
+            if qm status "$vmid" &>/dev/null; then echo "$n"; return 0; fi
+        else
+            if ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
+                "root@$(node_addr "$n")" "qm status ${vmid}" &>/dev/null; then
+                echo "$n"; return 0
+            fi
+        fi
+    done
+    return 1
+}
 
 # ── Load configuration ───────────────────────────────────────
 load_config() {
@@ -76,13 +117,20 @@ build_vm_list() {
 }
 
 # ── Pretty-print the planned VM list ─────────────────────────
+# If _VM_NODE_CACHE is populated (e.g. during delete), the NODE column
+# reflects the actual current node; a trailing (*) marks migrated VMs.
 print_vm_plan() {
     echo -e "\n${BOLD}  VM Deployment Plan (${VM_COUNT} VMs across ${NODE_COUNT} nodes)${NC}"
-    echo -e "  ${CYAN}$(printf '%-8s %-18s %-18s %-10s' VMID HOSTNAME IP NODE)${NC}"
-    echo "  $(printf '%0.s─' {1..56})"
+    echo -e "  ${CYAN}$(printf '%-8s %-18s %-18s %-14s' VMID HOSTNAME IP NODE)${NC}"
+    echo "  $(printf '%0.s─' {1..60})"
     for entry in "${VM_LIST[@]}"; do
         IFS=':' read -r vmid hostname ip node <<< "$entry"
-        echo "  $(printf '%-8s %-18s %-18s %-10s' "$vmid" "$hostname" "$ip" "$node")"
+        local display_node="$node"
+        if [[ -v _VM_NODE_CACHE["$vmid"] ]]; then
+            local cached="${_VM_NODE_CACHE[$vmid]}"
+            [[ "$cached" != "$node" ]] && display_node="${cached}(*)" || display_node="$cached"
+        fi
+        echo "  $(printf '%-8s %-18s %-18s %-14s' "$vmid" "$hostname" "$ip" "$display_node")"
     done
     echo ""
 }
@@ -287,15 +335,25 @@ create_vm() {
         fi
     fi
 
-    # 2. Import disk
+    # 2. Import disk and capture actual volume name (varies by storage type)
     run_on_node "$node" \
         "qm importdisk ${vmid} '${img_path}' ${STORAGE}"
 
-    # 3. Attach disk with virtio-scsi
+    local disk_volume
+    if [[ "$node" == "$EXECUTE_NODE" ]]; then
+        disk_volume=$(qm config "${vmid}" | awk -F': ' '/^unused0:/{print $2}')
+    else
+        disk_volume=$(ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes \
+            "root@$(node_addr "$node")" \
+            "qm config ${vmid} | awk -F': ' '/^unused0:/{print \$2}'")
+    fi
+    [[ -n "$disk_volume" ]] || error "Could not determine imported disk volume for VM ${vmid}"
+
+    # 3. Attach disk with virtio-scsi using actual volume name
     run_on_node "$node" \
         "qm set ${vmid} \
             --scsihw virtio-scsi-pci \
-            --scsi0 ${STORAGE}:vm-${vmid}-disk-0,discard=on"
+            --scsi0 ${disk_volume},discard=on"
 
     # 4. Resize disk
     run_on_node "$node" \
@@ -366,10 +424,17 @@ cmd_create() {
 # ── START all VMs ─────────────────────────────────────────────
 cmd_start() {
     stage "Start VMs"
+    load_vm_locations
     for entry in "${VM_LIST[@]}"; do
         IFS=':' read -r vmid hostname ip node <<< "$entry"
-        info "Starting VM ${vmid} (${hostname}) on ${node}"
-        if run_on_node "$node" "qm start ${vmid}"; then
+        local actual_node
+        if ! actual_node=$(find_vm_node "$vmid"); then
+            warn "VM ${vmid} (${hostname}) not found on any node, skipping"
+            continue
+        fi
+        [[ "$actual_node" != "$node" ]] &&             info "VM ${vmid} has migrated: ${node} → ${actual_node}"
+        info "Starting VM ${vmid} (${hostname}) on [${actual_node}]"
+        if run_on_node "$actual_node" "qm start ${vmid}"; then
             log "start vm ${vmid} success"
         else
             warn "Failed to start vm ${vmid}"
@@ -380,10 +445,17 @@ cmd_start() {
 # ── STOP all VMs ──────────────────────────────────────────────
 cmd_stop() {
     stage "Stop VMs"
+    load_vm_locations
     for entry in "${VM_LIST[@]}"; do
         IFS=':' read -r vmid hostname ip node <<< "$entry"
-        info "Stopping VM ${vmid} (${hostname}) on ${node}"
-        if run_on_node "$node" "qm stop ${vmid}"; then
+        local actual_node
+        if ! actual_node=$(find_vm_node "$vmid"); then
+            warn "VM ${vmid} (${hostname}) not found on any node, skipping"
+            continue
+        fi
+        [[ "$actual_node" != "$node" ]] &&             info "VM ${vmid} has migrated: ${node} → ${actual_node}"
+        info "Stopping VM ${vmid} (${hostname}) on [${actual_node}]"
+        if run_on_node "$actual_node" "qm stop ${vmid}"; then
             log "stop vm ${vmid} completed"
         else
             warn "Failed to stop vm ${vmid}"
@@ -395,37 +467,34 @@ cmd_stop() {
 cmd_delete() {
     stage "Delete VMs"
 
+    load_vm_locations
     print_vm_plan
     echo -e "${RED}WARNING: This will permanently delete all ${VM_COUNT} VMs and their disks!${NC}"
     read -r -p "Type 'yes' to confirm deletion: " confirm
     [[ "$confirm" == "yes" ]] || { info "Aborted."; exit 0; }
-
     for entry in "${VM_LIST[@]}"; do
         IFS=':' read -r vmid hostname ip node <<< "$entry"
-        info "Deleting VM ${vmid} (${hostname}) on ${node}"
-        # Check if VM exists before attempting delete
-        local _exists=false
-        if [[ "$node" == "$EXECUTE_NODE" ]]; then
-            qm status "$vmid" &>/dev/null && _exists=true || true
-        else
-            ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
-                "root@$(node_addr "$node")" "qm status ${vmid}" &>/dev/null && _exists=true || true
+        local actual_node
+        if ! actual_node=$(find_vm_node "$vmid"); then
+            warn "VM ${vmid} (${hostname}) not found on any node, skipping delete"
+            continue
         fi
-        if ! $_exists; then
-            warn "VM ${vmid} (${hostname}) not found on node [${node}], skipping delete"
+        [[ "$actual_node" != "$node" ]] &&             info "VM ${vmid} has migrated: ${node} → ${actual_node}"
+        info "Deleting VM ${vmid} (${hostname}) on [${actual_node}]"
+        run_on_node "$actual_node" "qm stop ${vmid} 2>/dev/null || true"
+        if run_on_node "$actual_node" "qm destroy ${vmid} --purge"; then
+            log "delete vm ${vmid} completed"
         else
-            run_on_node "$node" "qm stop ${vmid} 2>/dev/null || true"
-            run_on_node "$node" "qm destroy ${vmid} --purge" && \
-                log "delete vm ${vmid} completed" || \
-                warn "Failed to delete vm ${vmid}"
+            warn "Failed to delete vm ${vmid}"
         fi
 
-        # Remove cloud-init yaml
+        # Remove cloud-init yaml from the node actually hosting the VM
         local yaml_path="/var/lib/vz/snippets/tkcdc-${vmid}-user.yaml"
-        if [[ -f "$yaml_path" ]]; then rm -f "$yaml_path"; info "Removed $yaml_path"; fi
-        if [[ "$node" != "$EXECUTE_NODE" ]]; then
+        if [[ "$actual_node" == "$EXECUTE_NODE" ]]; then
+            [[ -f "$yaml_path" ]] && rm -f "$yaml_path" && info "Removed $yaml_path" || true
+        else
             ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes \
-                "root@$(node_addr "$node")" "rm -f ${yaml_path} 2>/dev/null || true"
+                "root@$(node_addr "$actual_node")" "rm -f ${yaml_path} 2>/dev/null || true"
         fi
     done
 
@@ -465,20 +534,27 @@ fi'
     script_b64=$(printf '%s' "$_check_script" | base64 -w0)
 
     stage "VM Status"
-    printf "  ${CYAN}%-8s %-18s %-18s %-10s %-10s %s${NC}\n" \
-        "VMID" "HOSTNAME" "IP" "NODE" "VM" "CLOUD-INIT"
+    printf "  ${CYAN}%-8s %-18s %-18s %-12s %-10s %s${NC}\n" \
+        "VMID" "HOSTNAME" "IP" "NODE(*=moved)" "VM" "CLOUD-INIT"
     echo "  $(printf '%0.s─' {1..90})"
 
+    load_vm_locations
     for entry in "${VM_LIST[@]}"; do
         IFS=':' read -r vmid hostname ip node <<< "$entry"
+        local actual_node
+        actual_node=$(find_vm_node "$vmid") || actual_node=""
+        local display_node="$actual_node"
+        [[ -n "$actual_node" && "$actual_node" != "$node" ]] &&             display_node="${actual_node}(*)"
 
         # ── VM power state ──────────────────────────────────────
         local vm_state
-        if [[ "$node" == "$EXECUTE_NODE" ]]; then
+        if [[ -z "$actual_node" ]]; then
+            vm_state="not found"
+        elif [[ "$actual_node" == "$EXECUTE_NODE" ]]; then
             vm_state=$(qm status "$vmid" 2>/dev/null | awk '{print $2}' || echo "unknown")
         else
             vm_state=$(ssh -n -o BatchMode=yes -o ConnectTimeout=3 \
-                "root@$(node_addr "$node")" \
+                "root@$(node_addr "$actual_node")" \
                 "qm status ${vmid} 2>/dev/null | awk '{print \$2}'" 2>/dev/null || echo "unknown")
         fi
 
@@ -488,12 +564,12 @@ fi'
             local ga_raw="" ga_out=""
 
             # Try 1: qm guest exec (requires qemu-guest-agent running inside VM)
-            if [[ "$node" == "$EXECUTE_NODE" ]]; then
+            if [[ "$actual_node" == "$EXECUTE_NODE" ]]; then
                 ga_raw=$(qm guest exec "$vmid" --timeout 10 -- \
                     bash -c "echo ${script_b64} | base64 -d | bash" 2>/dev/null || true)
             else
                 ga_raw=$(ssh -n -o BatchMode=yes -o ConnectTimeout=15 \
-                    "root@$(node_addr "$node")" \
+                    "root@$(node_addr "$actual_node")" \
                     "qm guest exec ${vmid} --timeout 10 -- bash -c 'echo ${script_b64} | base64 -d | bash'" \
                     2>/dev/null || true)
             fi
@@ -543,8 +619,8 @@ except:
             Error)   color="$RED"   ;;
         esac
 
-        printf "  %-8s %-18s %-18s %-10s %-10s " \
-            "$vmid" "$hostname" "$ip" "$node" "$vm_state"
+        printf "  %-8s %-18s %-18s %-12s %-10s " \
+            "$vmid" "$hostname" "$ip" "$display_node" "$vm_state"
         echo -e "${color}${ci_label}${NC}"
     done
     echo ""
