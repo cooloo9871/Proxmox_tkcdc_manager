@@ -178,7 +178,7 @@ write_files:
       # ~/.xprofile 必須在 runcmd 建立：write_files 執行時 user 還不存在，
       # chown 會失敗並讓整個 write_files 模組報錯。
       # xrdp session 啟動時最早載入 ~/.xprofile，確保 IBus env var 在所有
-      # 應用程式啟動前生效，是 Shift_L 切換能運作的關鍵前提。
+      # 應用程式啟動前生效，是 Shift_R 切換能運作的關鍵前提。
       cat > "/home/${USERNAME}/.xprofile" << 'XPEOF'
       export GTK_IM_MODULE=ibus
       export QT_IM_MODULE=ibus
@@ -195,13 +195,13 @@ write_files:
       #!/bin/bash
       gsettings set org.freedesktop.ibus.general preload-engines "['xkb:us::eng', 'chewing']"
       gsettings set org.freedesktop.ibus.general engines-order "['xkb:us::eng', 'chewing']"
-      gsettings set org.freedesktop.ibus.general.hotkey triggers "['Shift_L']"
+      gsettings set org.freedesktop.ibus.general.hotkey triggers "['Shift_R']"
       CFGEOF
       chmod 755 /tmp/ibus-cfg.sh
       # dbus-run-session provides a session bus without needing a display
       su - "$USERNAME" -c "dbus-run-session -- bash /tmp/ibus-cfg.sh" || true
       rm -f /tmp/ibus-cfg.sh
-      # XFCE autostart (one-shot): 首次登入時確保 IBus Shift_L hotkey 已寫入 dconf
+      # XFCE autostart (one-shot): 首次登入時確保 IBus Shift_R hotkey 已寫入 dconf
       # 並重啟 IBus，讓設定立即生效。執行完後自刪，之後登入不再執行。
       HOME_DIR="/home/${USERNAME}"
       AUTOSTART_DIR="${HOME_DIR}/.config/autostart"
@@ -210,7 +210,7 @@ write_files:
       cat > "$SETUP_SCRIPT" << 'SHEOF'
       #!/bin/bash
       sleep 5
-      gsettings set org.freedesktop.ibus.general.hotkey triggers "['Shift_L']"
+      gsettings set org.freedesktop.ibus.general.hotkey triggers "['Shift_R']"
       ibus restart
       rm -f "$HOME/.ibus-shift-setup.sh" "$HOME/.config/autostart/ibus-shift-setup.desktop"
       SHEOF
@@ -219,7 +219,7 @@ write_files:
       cat > "${AUTOSTART_DIR}/ibus-shift-setup.desktop" << DESKTOPEOF
       [Desktop Entry]
       Type=Application
-      Name=IBus Shift_L Hotkey Setup
+      Name=IBus Shift_R Hotkey Setup
       Exec=${SETUP_SCRIPT}
       Hidden=false
       NoDisplay=false
