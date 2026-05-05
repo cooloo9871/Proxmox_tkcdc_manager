@@ -27,9 +27,37 @@ system_info:
 ssh_pwauth: true
 
 # ------------------------------------------------------------
+# APT mirror: 改用台灣 NCHC 國網中心鏡像
+# 比 archive.ubuntu.com 穩定很多（台灣對外連 Canonical 偶爾超慢甚至斷線，
+# 是先前 xrdp 安裝失敗、套件下載 timeout 的主因）。
+# 此設定會在 package_update / package_upgrade / packages 之前套用。
+# 替代選擇：free.nchc.org.tw、mirror.twds.com.tw、ftp.yzu.edu.tw
+# ------------------------------------------------------------
+apt:
+  primary:
+    - arches: [default]
+      uri: http://free.nchc.org.tw/ubuntu/
+  security:
+    - arches: [default]
+      uri: http://free.nchc.org.tw/ubuntu/
+
+# ------------------------------------------------------------
 # DNS
 # ------------------------------------------------------------
 write_files:
+  # apt 強化下載穩定性：
+  # - ForceIPv4：VM 無 IPv6 路由時，避免 apt 浪費時間嘗試 IPv6 address。
+  # - Retries：archive.ubuntu.com 偶爾很慢/不穩，預設 3 次容易失敗導致整個 install 中斷。
+  # - http::Timeout：拉長單次連線 timeout，避免下載速度慢時被誤判為斷線。
+  - path: /etc/apt/apt.conf.d/99force-ipv4
+    permissions: '0644'
+    owner: root:root
+    content: |
+      Acquire::ForceIPv4 "true";
+      Acquire::Retries "10";
+      Acquire::http::Timeout "120";
+      Acquire::https::Timeout "120";
+
   # Kernel modules: br_netfilter (required for k8s bridge iptables rules),
   # overlay (container overlayfs storage), tcp_bbr (BBR congestion control)
   - path: /etc/modules-load.d/tkcdc.conf
@@ -147,6 +175,16 @@ write_files:
     content: |
       #!/bin/bash
       USERNAME="__VM_USER__"
+      # ~/.xprofile 必須在 runcmd 建立：write_files 執行時 user 還不存在，
+      # chown 會失敗並讓整個 write_files 模組報錯。
+      # xrdp session 啟動時最早載入 ~/.xprofile，確保 IBus env var 在所有
+      # 應用程式啟動前生效，是 Shift_L 切換能運作的關鍵前提。
+      cat > "/home/${USERNAME}/.xprofile" << 'XPEOF'
+      export GTK_IM_MODULE=ibus
+      export QT_IM_MODULE=ibus
+      export XMODIFIERS=@im=ibus
+      XPEOF
+      chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.xprofile"
       # Configure im-config to use IBus — creates ~/.xinputrc with "run_im ibus".
       # 70im-config_launch reads ~/.xinputrc and wraps STARTUP with im-launch,
       # which sets GTK_IM_MODULE / XMODIFIERS / QT_IM_MODULE before xfce4 starts.
@@ -157,11 +195,37 @@ write_files:
       #!/bin/bash
       gsettings set org.freedesktop.ibus.general preload-engines "['xkb:us::eng', 'chewing']"
       gsettings set org.freedesktop.ibus.general engines-order "['xkb:us::eng', 'chewing']"
+      gsettings set org.freedesktop.ibus.general.hotkey triggers "['Shift_L']"
       CFGEOF
       chmod 755 /tmp/ibus-cfg.sh
       # dbus-run-session provides a session bus without needing a display
       su - "$USERNAME" -c "dbus-run-session -- bash /tmp/ibus-cfg.sh" || true
       rm -f /tmp/ibus-cfg.sh
+      # XFCE autostart (one-shot): 首次登入時確保 IBus Shift_L hotkey 已寫入 dconf
+      # 並重啟 IBus，讓設定立即生效。執行完後自刪，之後登入不再執行。
+      HOME_DIR="/home/${USERNAME}"
+      AUTOSTART_DIR="${HOME_DIR}/.config/autostart"
+      SETUP_SCRIPT="${HOME_DIR}/.ibus-shift-setup.sh"
+      mkdir -p "$AUTOSTART_DIR"
+      cat > "$SETUP_SCRIPT" << 'SHEOF'
+      #!/bin/bash
+      sleep 5
+      gsettings set org.freedesktop.ibus.general.hotkey triggers "['Shift_L']"
+      ibus restart
+      rm -f "$HOME/.ibus-shift-setup.sh" "$HOME/.config/autostart/ibus-shift-setup.desktop"
+      SHEOF
+      chmod 755 "$SETUP_SCRIPT"
+      chown "${USERNAME}:${USERNAME}" "$SETUP_SCRIPT"
+      cat > "${AUTOSTART_DIR}/ibus-shift-setup.desktop" << DESKTOPEOF
+      [Desktop Entry]
+      Type=Application
+      Name=IBus Shift_L Hotkey Setup
+      Exec=${SETUP_SCRIPT}
+      Hidden=false
+      NoDisplay=false
+      X-GNOME-Autostart-enabled=true
+      DESKTOPEOF
+      chown "${USERNAME}:${USERNAME}" "${AUTOSTART_DIR}/ibus-shift-setup.desktop"
 
   # Xfce4 performance: disable compositor (biggest xrdp lag source)
   - path: /tmp/setup-xfce4-perf.sh
@@ -275,8 +339,11 @@ write_files:
          echo 'Acquire::https::Proxy "http://$PROXY:3128";' | sudo tee -a /etc/apt/apt.conf
       fi
 
-      echo "Welcome to Ubuntu 24.04 : $IP"
-      echo ""
+      if [ -z "$_TKCDC_SOURCED" ]; then
+        export _TKCDC_SOURCED=1
+        echo "Welcome to Ubuntu 24.04 : $IP"
+        echo ""
+      fi
 
       export NOW="--force --grace-period 0"
       export KUBE_EDITOR="nano"
@@ -361,6 +428,18 @@ runcmd:
   # ── xrdp via local installer (injected by generate_user_data) ──
   # Script must run as a normal user (it calls sudo internally)
   - su - __VM_USER__ -c "bash /tmp/xrdp-installer.sh"
+  # Verify xrdp actually installed (xrdp-installer 不檢查 apt 失敗，會誤報成功)。
+  # 如果 xrdp.service 不存在就用 --fix-missing 補裝，必要時重試多次。
+  - |
+    if ! systemctl list-unit-files 2>/dev/null | grep -q '^xrdp\.service'; then
+      echo "[xrdp-fix] xrdp install failed during xrdp-installer, retrying..."
+      for i in 1 2 3; do
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-missing xrdp xorgxrdp && break
+        echo "[xrdp-fix] attempt $i failed, sleeping 10s..."
+        sleep 10
+      done
+      systemctl enable --now xrdp || true
+    fi
   # Set xfce4 as xrdp desktop session via ~/.profile so startwm.sh's pre_start()
   # picks it up and calls get_xdg_session_startupcmd before Xsession.d runs.
   # This lets 70im-config_launch properly wrap STARTUP with im-launch (IBus init).
@@ -377,8 +456,10 @@ runcmd:
   # Pre-configure IBus chewing (注音) input method
   - bash /tmp/setup-ibus.sh
   # ── Firefox deb (via Mozilla PPA, avoids snap sandbox issues in xrdp) ──
-  - add-apt-repository -y ppa:mozillateam/ppa
-  - apt-get install -y firefox
+  # DEBIAN_FRONTEND=noninteractive: 防止 apt 在無 TTY 環境跳出 kernel upgrade 互動對話框
+  # || true: PPA 連不到時 cloud-init 不標為 Error，Firefox 可事後手動裝
+  - DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:mozillateam/ppa
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y firefox || true
   # ── podman rootless ─────────────────────────────────────────
   - bash /tmp/setup-podman-rootless.sh
   # ── k8s tools (CNI / kubectl / cilium) + taroko package ────
