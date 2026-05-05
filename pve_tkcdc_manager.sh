@@ -211,11 +211,17 @@ download_image() {
     mkdir -p "$IMAGE_DIR"
     local img_path="${IMAGE_DIR}/${IMAGE_NAME}"
 
-    if [[ -f "$img_path" ]]; then
+    # 用 wget -c 支援續傳：如果上次下載中斷，這次接著傳；
+    # 用檔案大小驗證避免損壞 image 被當成完整檔（Ubuntu cloud image 通常 > 500MB）。
+    local min_size=$((100 * 1024 * 1024))   # 100 MB sanity check
+    if [[ -f "$img_path" ]] && [[ $(stat -c%s "$img_path" 2>/dev/null || echo 0) -ge $min_size ]]; then
         info "Image already exists: $img_path (skipping download)"
     else
+        if [[ -f "$img_path" ]]; then
+            warn "Existing image looks incomplete (< 100MB), resuming/redownloading..."
+        fi
         info "Downloading $IMAGE_URL ..."
-        wget -q --show-progress "$IMAGE_URL" -O "$img_path" || \
+        wget -c -q --show-progress "$IMAGE_URL" -O "$img_path" || \
             error "Failed to download image"
         log "Image downloaded: $img_path"
     fi
@@ -253,7 +259,7 @@ generate_user_data() {
     cat > "$py_script" << 'PYEOF'
 import sys, base64
 
-tpl_file, yaml_file, script_file, vm_hostname, vm_user, vm_password, nameserver, enable_tk8s = sys.argv[1:9]
+tpl_file, yaml_file, script_file, vm_hostname, vm_user, vm_password, enable_tk8s = sys.argv[1:8]
 
 # Read template and do variable substitution (handles any special chars)
 with open(tpl_file, 'r') as f:
@@ -263,7 +269,6 @@ for key, val in {
     '__VM_HOSTNAME__':  vm_hostname,
     '__VM_USER__':      vm_user,
     '__VM_PASSWORD__':  vm_password,
-    '__NAMESERVER__':   nameserver,
     '__ENABLE_TK8S__':  enable_tk8s,
 }.items():
     content = content.replace(key, val)
@@ -295,7 +300,7 @@ with open(yaml_file, 'w') as f:
     f.write(content)
 PYEOF
     python3 "$py_script" "$USER_DATA_TPL" "$yaml_path" "$xrdp_script" \
-        "$hostname" "$VM_USER" "$VM_PASSWORD" "$NAMESERVER" "${ENABLE_TK8S:-false}"
+        "$hostname" "$VM_USER" "$VM_PASSWORD" "${ENABLE_TK8S:-false}"
 
     echo "$yaml_path"
 }
@@ -534,9 +539,10 @@ fi'
     script_b64=$(printf '%s' "$_check_script" | base64 -w0)
 
     stage "VM Status"
-    printf "  ${CYAN}%-8s %-18s %-18s %-12s %-10s %s${NC}\n" \
+    # NODE 欄寬度 14：容納表頭 "NODE(*=moved)" (13 字元) 不溢位，避免後面欄位錯位
+    printf "  ${CYAN}%-8s %-18s %-18s %-14s %-10s %s${NC}\n" \
         "VMID" "HOSTNAME" "IP" "NODE(*=moved)" "VM" "CLOUD-INIT"
-    echo "  $(printf '%0.s─' {1..90})"
+    echo "  $(printf '%0.s─' {1..92})"
 
     load_vm_locations
     for entry in "${VM_LIST[@]}"; do
@@ -619,7 +625,7 @@ except:
             Error)   color="$RED"   ;;
         esac
 
-        printf "  %-8s %-18s %-18s %-12s %-10s " \
+        printf "  %-8s %-18s %-18s %-14s %-10s " \
             "$vmid" "$hostname" "$ip" "$display_node" "$vm_state"
         echo -e "${color}${ci_label}${NC}"
     done

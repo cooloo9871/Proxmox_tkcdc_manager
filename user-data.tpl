@@ -3,7 +3,7 @@
 # Proxmox_tkcdc_manager - Cloud-Init User Data Template
 # This file is generated per-VM by pve_tkcdc_manager.sh
 # Variables __VM_HOSTNAME__, __VM_USER__, __VM_PASSWORD__,
-# __NAMESERVER__ are replaced at runtime.
+# __ENABLE_TK8S__ are replaced at runtime by generate_user_data().
 # The xrdp installer script is injected as a base64-encoded
 # write_files entry by generate_user_data() at build time.
 # ============================================================
@@ -126,11 +126,10 @@ write_files:
       # Allow more PIDs for container workloads
       kernel.pid_max = 4194304
 
-  - path: /etc/resolv.conf
-    permissions: '0644'
-    owner: root:root
-    content: |
-      nameserver __NAMESERVER__
+  # /etc/resolv.conf 不在 write_files 寫入：Ubuntu 24.04 是 systemd-resolved
+  # 管理的 symlink (→ /run/systemd/resolve/stub-resolv.conf)，蓋成一般檔案會
+  # 繞過 systemd-resolved 並破壞 split DNS。DNS 已由 PVE 的 qm set --nameserver
+  # 透過 netplan 設定，systemd-resolved 會自動讀取。
 
   # SSH: 覆寫 Ubuntu Cloud Image 預設的 60-cloudimg-settings.conf
   # 該檔預設 PasswordAuthentication no，必須覆寫否則無法密碼登入
@@ -225,7 +224,9 @@ write_files:
       NoDisplay=false
       X-GNOME-Autostart-enabled=true
       DESKTOPEOF
-      chown "${USERNAME}:${USERNAME}" "${AUTOSTART_DIR}/ibus-shift-setup.desktop"
+      # 整個 .config 樹 chown 給 user：mkdir -p 以 root 身份建立的子目錄會繼承 root owner，
+      # 跟 setup-xfce4-perf.sh 已 chown 過的 .config 不一致。一次性把整棵樹歸還給 user。
+      chown -R "${USERNAME}:${USERNAME}" "${HOME_DIR}/.config"
 
   # Xfce4 performance: disable compositor (biggest xrdp lag source)
   - path: /tmp/setup-xfce4-perf.sh
@@ -303,6 +304,14 @@ write_files:
               echo "[setup-tools] kto tk8s failed — check ~/tk logs."
       fi
 
+      # 結尾驗證（沒 set -e 是故意的：希望單一下載失敗不要整個中斷，
+      # 但要在 cloud-init log 留警告，事後可從 log 查哪些缺掉再手動補）
+      echo "[setup-tools] Validating installations..."
+      [ -x /usr/local/bin/kubectl ] || echo "[setup-tools] WARNING: kubectl missing"
+      [ -x /usr/local/bin/cilium ]  || echo "[setup-tools] WARNING: cilium missing"
+      [ -d "${HOME_DIR}/cni" ] && [ -n "$(ls -A ${HOME_DIR}/cni 2>/dev/null)" ] \
+          || echo "[setup-tools] WARNING: CNI plugins missing"
+      [ -d "${HOME_DIR}/tk" ] || echo "[setup-tools] WARNING: taroko package missing"
       echo "[setup-tools] Done."
 
   # /etc/profile.d/tkcdc.sh — shell environment for all login sessions
@@ -364,8 +373,115 @@ write_files:
       alias docker='sudo podman'
       alias pc='sudo podman system prune -a -f; sudo podman volume rm -a -f'
       alias vms='sudo /usr/bin/vmware-toolbox-cmd disk shrink /'
-      source /usr/share/bash-completion/bash_completion
+      [ -r /usr/share/bash-completion/bash_completion ] && source /usr/share/bash-completion/bash_completion
       command -v kubectl &>/dev/null && source <(kubectl completion bash) || true
+
+  # /etc/profile.d/zz-sinfo.sh — 在 PVE Console (serial /dev/ttyS*) 登入時用 dialog
+  # 顯示 VM 資訊（Hostname / Memory / CPU / Disk / IP / Gateway / DNS）。
+  # zz- 前綴確保在 tkcdc.sh 之後執行（PATH 等已就緒）。
+  # 條件：tty 是 /dev/ttyS* 且非 SSH session，避免在 xfce4-terminal / SSH 也跳出 dialog。
+  - path: /etc/profile.d/zz-sinfo.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      if [[ "$(tty 2>/dev/null)" == /dev/ttyS* ]] && [ -z "$SSH_TTY" ]; then
+          # cloud-init boot 期間大量 log 輸出到 ttyS0，會把終端狀態搞亂導致
+          # dialog (ncurses) 無法正確 render。先 reset 清掉 cloud-init 殘留再畫 dialog。
+          reset
+          gw=$(route -n | grep -e "^0.0.0.0 ")
+          export GWIF=${gw##* }
+          ips=$(ifconfig $GWIF | grep 'inet ')
+          export IP=$(echo $ips | cut -d' ' -f2 | cut -d':' -f2)
+          export NETID=${IP%.*}
+          export GW=$(route -n | grep -e '^0.0.0.0' | tr -s \ - | cut -d ' ' -f2)
+
+          echo "[System]" > /tmp/sinfo
+          echo "Hostname : $(hostname)" >> /tmp/sinfo
+
+          m=$(free -mh | grep Mem: | tr -s ' ' | cut -d' ' -f2)
+          echo "Memory : ${m}" >> /tmp/sinfo
+
+          # xargs 去掉 cut 後 leading space（/proc/cpuinfo 用 ": " 分隔）
+          cname=$(grep 'model name' /proc/cpuinfo | head -n 1 | cut -d ':' -f2 | xargs)
+          cnumber=$(grep -c 'model name' /proc/cpuinfo)
+          echo "CPU : $cname (core: $cnumber)" >> /tmp/sinfo
+
+          # 用 root filesystem 不 hardcode /dev/sda：相容 virtio-blk(/dev/vda)、NVMe、LVM
+          ds=$(df -h / | awk 'NR==2 {print $2}')
+          echo "Disk : $ds" >> /tmp/sinfo
+
+          if kubectl get no &>/dev/null; then
+              echo "Kubernetes: enabled" >> /tmp/sinfo
+          fi
+
+          echo "" >> /tmp/sinfo
+          echo "[Network]" >> /tmp/sinfo
+          echo "IP : $IP" >> /tmp/sinfo
+          echo "Gateway : $GW" >> /tmp/sinfo
+          # 抓 nameserver：先試 netplan glob，再 fallback 到 resolvectl。
+          # /etc/resolv.conf 在 Ubuntu 24.04 是 systemd-resolved stub (127.0.0.53)，沒用。
+          NS=""
+          for f in /etc/netplan/*.yaml; do
+              [ -f "$f" ] || continue
+              NS=$(grep -A5 'nameservers:' "$f" 2>/dev/null \
+                   | grep -E '^[[:space:]]+-[[:space:]]+[0-9]' | head -1 | awk '{print $2}')
+              [ -n "$NS" ] && break
+          done
+          [ -z "$NS" ] && NS=$(resolvectl dns 2>/dev/null \
+                               | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+          echo "DNS : $NS" >> /tmp/sinfo
+
+          # 明確算出置中座標（dialog 在 PVE xterm.js 下預設置中有時失準）
+          DH=20; DW=78
+          read TR TC < <(stty size 2>/dev/null || echo "25 80")
+          BY=$(( (TR - DH) / 2 )); [ "$BY" -lt 0 ] && BY=0
+          BX=$(( (TC - DW) / 2 )); [ "$BX" -lt 0 ] && BX=0
+          # PVE Console 切換/重連時 xterm.js 會重建終端緩衝，--textbox 不會主動重畫。
+          # 改用 --infobox（畫完立即返回，不等輸入）+ 2 秒 loop：
+          # 每次 iteration 都是新的 dialog process，ncurses initscr 重新做完整繪製，
+          # 所以即使 xterm.js 重連到空白終端，最多 2 秒就會重新出現 dialog。
+          # 注意：此模式下 PVE Console 變 kiosk，無法進 bash；要 shell 請用 SSH 或 xRDP。
+          if [ -f /tmp/sinfo ]; then
+              while true; do
+                  dialog --begin $BY $BX --title " Cloud Native Trainer " --infobox "$(cat /tmp/sinfo)" $DH $DW
+                  sleep 2
+              done
+          fi
+      fi
+
+  # serial-getty 自動登入：PVE Console (Serial terminal 0) 開啟後直接登入 __VM_USER__，
+  # 不用手動輸入帳密，登入後 zz-sinfo.sh 自動跑 dialog 顯示 VM 資訊。
+  - path: /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf
+    permissions: '0644'
+    owner: root:root
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=-/sbin/agetty --autologin __VM_USER__ --keep-baud 115200,38400,9600 %I $TERM
+
+  # dialog-ready service: 在 cloud-final.service 完全結束後才重啟 serial-getty。
+  # 必要性：cloud-init 期間有大量 log 輸出到 /dev/console，若在 runcmd 內直接重啟，
+  # autologin 觸發後 dialog 會被後續 cloud-init 輸出蓋掉。
+  # marker 放在 /var/lib/cloud/instance/，cloud-init clean 會清掉，重跑時能重新觸發。
+  - path: /etc/systemd/system/dialog-ready.service
+    permissions: '0644'
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Restart serial-getty after cloud-init for clean dialog rendering
+      After=cloud-final.service
+      ConditionPathExists=!/var/lib/cloud/instance/.dialog-ready
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStartPre=/bin/sleep 5
+      ExecStart=/bin/systemctl restart serial-getty@ttyS0.service
+      ExecStartPost=/bin/touch /var/lib/cloud/instance/.dialog-ready
+
+      [Install]
+      WantedBy=multi-user.target
 
   # Podman rootless setup script (runs as VM_USER)
   - path: /tmp/setup-podman-rootless.sh
@@ -409,6 +525,7 @@ packages:
   - ibus-chewing
   - fonts-noto-cjk
   - jq
+  - dialog
 
 # ------------------------------------------------------------
 # Run commands at first boot
@@ -425,6 +542,12 @@ runcmd:
   - systemctl disable --now ufw
   # ── SSH 重啟套用密碼登入設定 ────────────────────────────
   - systemctl restart ssh
+  # ── 載入 systemd 新單元（autologin override + dialog-ready service）──
+  # serial-getty 的 restart 不在這做：cloud-init 後續還會輸出大量訊息到
+  # /dev/console，會把 dialog 蓋掉。改由 dialog-ready.service 在
+  # cloud-final.service 完全結束後才重啟 ttyS0 getty。
+  - systemctl daemon-reload
+  - systemctl start --no-block dialog-ready.service
   # ── xrdp via local installer (injected by generate_user_data) ──
   # Script must run as a normal user (it calls sudo internally)
   - su - __VM_USER__ -c "bash /tmp/xrdp-installer.sh"
@@ -457,8 +580,8 @@ runcmd:
   - bash /tmp/setup-ibus.sh
   # ── Firefox deb (via Mozilla PPA, avoids snap sandbox issues in xrdp) ──
   # DEBIAN_FRONTEND=noninteractive: 防止 apt 在無 TTY 環境跳出 kernel upgrade 互動對話框
-  # || true: PPA 連不到時 cloud-init 不標為 Error，Firefox 可事後手動裝
-  - DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:mozillateam/ppa
+  # || true: PPA / install 失敗時 cloud-init 不標為 Error，Firefox 可事後手動裝
+  - DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:mozillateam/ppa || true
   - DEBIAN_FRONTEND=noninteractive apt-get install -y firefox || true
   # ── podman rootless ─────────────────────────────────────────
   - bash /tmp/setup-podman-rootless.sh
