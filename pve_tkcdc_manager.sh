@@ -526,11 +526,15 @@ cmd_select_storage() {
 # ── STATUS: show current VM state and cloud-init progress ───────
 cmd_status() {
     # Script run inside each VM via qemu guest agent or SSH.
+    # 改用 grep 而非 cut：cloud-init 不同版本輸出格式不一（多行、多空格），
+    # 用正則找 "status: <state>" 行更穩。NOCLI 表示 cloud-init 命令本身失敗。
     local _check_script='
-status=$(cloud-init status 2>/dev/null | cut -d" " -f2)
-if [ "$status" = "done" ]; then
+out=$(cloud-init status 2>/dev/null)
+if [ -z "$out" ]; then
+    echo "NOCLI"
+elif echo "$out" | grep -qE "^status:[[:space:]]*done"; then
     echo "DONE"
-elif [ "$status" = "error" ]; then
+elif echo "$out" | grep -qE "^status:[[:space:]]*error"; then
     echo "ERROR"
 else
     echo "RUNNING"
@@ -613,7 +617,9 @@ except:
                     DONE)    ci_label="Ready" ;;
                     ERROR)   ci_label="Error" ;;
                     RUNNING) ci_label="Waiting..." ;;
-                    *)       ci_label="Waiting..." ;;
+                    NOCLI)   ci_label="No cloud-init" ;;
+                    "")      ci_label="Agent N/A" ;;
+                    *)       ci_label="Unknown" ;;
                 esac
             fi
         fi
@@ -621,8 +627,9 @@ except:
         # ── Colorize ────────────────────────────────────────────
         local color="$NC"
         case "$ci_label" in
-            Ready)   color="$GREEN" ;;
-            Error)   color="$RED"   ;;
+            Ready)                                color="$GREEN"  ;;
+            Error)                                color="$RED"    ;;
+            "Agent N/A"|"No cloud-init"|Unknown)  color="$YELLOW" ;;
         esac
 
         printf "  %-8s %-18s %-18s %-14s %-10s " \

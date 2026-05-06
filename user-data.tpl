@@ -297,12 +297,8 @@ write_files:
       chown -R "${USERNAME}:${USERNAME}" "${HOME_DIR}/.kube"
 
       # ── taroko k8s auto-setup ────────────────────────────────────
-      if [ "__ENABLE_TK8S__" = "true" ]; then
-          echo "[setup-tools] Starting taroko k8s (kto tk8s)..."
-          su - "$USERNAME" -c "bash --login -c 'kto tk8s'" && \
-              echo "[setup-tools] kto tk8s completed." || \
-              echo "[setup-tools] kto tk8s failed — check ~/tk logs."
-      fi
+      # tk8s 不在 cloud-init 跑：cloud-init 升級了 kernel，要 reboot 後新 kernel
+      # 才生效。tk8s 由 tk8s-post-boot.service 在 reboot 後乾淨環境裝（更穩定）。
 
       # 結尾驗證（沒 set -e 是故意的：希望單一下載失敗不要整個中斷，
       # 但要在 cloud-init log 留警告，事後可從 log 查哪些缺掉再手動補）
@@ -389,65 +385,67 @@ write_files:
           # cloud-init boot 期間大量 log 輸出到 ttyS0，會把終端狀態搞亂導致
           # dialog (ncurses) 無法正確 render。先 reset 清掉 cloud-init 殘留再畫 dialog。
           reset
-          gw=$(route -n | grep -e "^0.0.0.0 ")
-          export GWIF=${gw##* }
-          ips=$(ifconfig $GWIF | grep 'inet ')
-          export IP=$(echo $ips | cut -d' ' -f2 | cut -d':' -f2)
-          export NETID=${IP%.*}
-          export GW=$(route -n | grep -e '^0.0.0.0' | tr -s \ - | cut -d ' ' -f2)
 
-          echo "[System]" > /tmp/sinfo
-          echo "Hostname : $(hostname)" >> /tmp/sinfo
+          # /tmp/sinfo 生成函數：每次 loop 重新呼叫，反映最新狀態
+          # （特別是 Kubernetes：tk8s-post-boot.service 後完成，要重抓才會顯示）
+          gen_sinfo() {
+              local gw ips IP GW m cname cnumber ds NS f
+              gw=$(route -n | grep -e "^0.0.0.0 ")
+              local GWIF=${gw##* }
+              ips=$(ifconfig $GWIF | grep 'inet ')
+              IP=$(echo $ips | cut -d' ' -f2 | cut -d':' -f2)
+              GW=$(route -n | grep -e '^0.0.0.0' | tr -s \ - | cut -d ' ' -f2)
 
-          m=$(free -mh | grep Mem: | tr -s ' ' | cut -d' ' -f2)
-          echo "Memory : ${m}" >> /tmp/sinfo
-
-          # xargs 去掉 cut 後 leading space（/proc/cpuinfo 用 ": " 分隔）
-          cname=$(grep 'model name' /proc/cpuinfo | head -n 1 | cut -d ':' -f2 | xargs)
-          cnumber=$(grep -c 'model name' /proc/cpuinfo)
-          echo "CPU : $cname (core: $cnumber)" >> /tmp/sinfo
-
-          # 用 root filesystem 不 hardcode /dev/sda：相容 virtio-blk(/dev/vda)、NVMe、LVM
-          ds=$(df -h / | awk 'NR==2 {print $2}')
-          echo "Disk : $ds" >> /tmp/sinfo
-
-          if kubectl get no &>/dev/null; then
-              echo "Kubernetes: enabled" >> /tmp/sinfo
-          fi
-
-          echo "" >> /tmp/sinfo
-          echo "[Network]" >> /tmp/sinfo
-          echo "IP : $IP" >> /tmp/sinfo
-          echo "Gateway : $GW" >> /tmp/sinfo
-          # 抓 nameserver：先試 netplan glob，再 fallback 到 resolvectl。
-          # /etc/resolv.conf 在 Ubuntu 24.04 是 systemd-resolved stub (127.0.0.53)，沒用。
-          NS=""
-          for f in /etc/netplan/*.yaml; do
-              [ -f "$f" ] || continue
-              NS=$(grep -A5 'nameservers:' "$f" 2>/dev/null \
-                   | grep -E '^[[:space:]]+-[[:space:]]+[0-9]' | head -1 | awk '{print $2}')
-              [ -n "$NS" ] && break
-          done
-          [ -z "$NS" ] && NS=$(resolvectl dns 2>/dev/null \
-                               | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
-          echo "DNS : $NS" >> /tmp/sinfo
+              {
+                  echo "[System]"
+                  echo "Hostname : $(hostname)"
+                  m=$(free -mh | grep Mem: | tr -s ' ' | cut -d' ' -f2)
+                  echo "Memory : ${m}"
+                  # xargs 去掉 cut 後 leading space（/proc/cpuinfo 用 ": " 分隔）
+                  cname=$(grep 'model name' /proc/cpuinfo | head -n 1 | cut -d ':' -f2 | xargs)
+                  cnumber=$(grep -c 'model name' /proc/cpuinfo)
+                  echo "CPU : $cname (core: $cnumber)"
+                  # 用 root filesystem 不 hardcode /dev/sda：相容 virtio-blk、NVMe、LVM
+                  ds=$(df -h / | awk 'NR==2 {print $2}')
+                  echo "Disk : $ds"
+                  # timeout 2 防止 kubectl 在 API server 還沒起來時卡住整個 dialog
+                  if timeout 2 kubectl get no &>/dev/null; then
+                      echo "Kubernetes: enabled"
+                  fi
+                  echo ""
+                  echo "[Network]"
+                  echo "IP : $IP"
+                  echo "Gateway : $GW"
+                  # nameserver 從 netplan 抓，fallback resolvectl（/etc/resolv.conf 是 stub）
+                  NS=""
+                  for f in /etc/netplan/*.yaml; do
+                      [ -f "$f" ] || continue
+                      NS=$(grep -A5 'nameservers:' "$f" 2>/dev/null \
+                           | grep -E '^[[:space:]]+-[[:space:]]+[0-9]' | head -1 | awk '{print $2}')
+                      [ -n "$NS" ] && break
+                  done
+                  [ -z "$NS" ] && NS=$(resolvectl dns 2>/dev/null \
+                                       | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+                  echo "DNS : $NS"
+              } > /tmp/sinfo
+          }
 
           # 明確算出置中座標（dialog 在 PVE xterm.js 下預設置中有時失準）
           DH=20; DW=78
           read TR TC < <(stty size 2>/dev/null || echo "25 80")
           BY=$(( (TR - DH) / 2 )); [ "$BY" -lt 0 ] && BY=0
           BX=$(( (TC - DW) / 2 )); [ "$BX" -lt 0 ] && BX=0
-          # PVE Console 切換/重連時 xterm.js 會重建終端緩衝，--textbox 不會主動重畫。
-          # 改用 --infobox（畫完立即返回，不等輸入）+ 2 秒 loop：
-          # 每次 iteration 都是新的 dialog process，ncurses initscr 重新做完整繪製，
-          # 所以即使 xterm.js 重連到空白終端，最多 2 秒就會重新出現 dialog。
+
+          # 每次 iteration 重新生成 /tmp/sinfo + 重畫 dialog：
+          # - tk8s-post-boot.service 完成後 Kubernetes 狀態會自動反映
+          # - PVE Console 切換/重連時 xterm.js 會重建終端緩衝，新的 dialog process
+          #   ncurses initscr 重新做完整繪製，最多 2 秒重新出現
           # 注意：此模式下 PVE Console 變 kiosk，無法進 bash；要 shell 請用 SSH 或 xRDP。
-          if [ -f /tmp/sinfo ]; then
-              while true; do
-                  dialog --begin $BY $BX --title " Cloud Native Trainer " --infobox "$(cat /tmp/sinfo)" $DH $DW
-                  sleep 2
-              done
-          fi
+          while true; do
+              gen_sinfo
+              dialog --begin $BY $BX --title " Cloud Native Trainer " --infobox "$(cat /tmp/sinfo)" $DH $DW
+              sleep 2
+          done
       fi
 
   # serial-getty 自動登入：PVE Console (Serial terminal 0) 開啟後直接登入 __VM_USER__，
@@ -460,25 +458,48 @@ write_files:
       ExecStart=
       ExecStart=-/sbin/agetty --autologin __VM_USER__ --keep-baud 115200,38400,9600 %I $TERM
 
-  # dialog-ready service: 在 cloud-final.service 完全結束後才重啟 serial-getty。
-  # 必要性：cloud-init 期間有大量 log 輸出到 /dev/console，若在 runcmd 內直接重啟，
-  # autologin 觸發後 dialog 會被後續 cloud-init 輸出蓋掉。
-  # marker 放在 /var/lib/cloud/instance/，cloud-init clean 會清掉，重跑時能重新觸發。
-  - path: /etc/systemd/system/dialog-ready.service
+  # tk8s post-boot installer: cloud-init 結束後 reboot，第二次 boot 時跑這個。
+  # ENABLE_TK8S 在 generate_user_data() 時被 substitute 進腳本，重啟後一樣有效。
+  - path: /usr/local/bin/tk8s-install.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      ENABLE_TK8S="__ENABLE_TK8S__"
+      USERNAME="__VM_USER__"
+      if [ "$ENABLE_TK8S" != "true" ]; then
+          echo "[tk8s-install] ENABLE_TK8S=$ENABLE_TK8S, skip."
+          exit 0
+      fi
+      echo "[tk8s-install] Running kto tk8s as $USERNAME..."
+      # su - 已是 login shell，會 source /etc/profile + ~/.profile（PATH 含 ~/tk/bin），
+      # 不需要再套一層 bash --login -c。
+      su - "$USERNAME" -c 'kto tk8s' \
+          && echo "[tk8s-install] kto tk8s completed." \
+          || echo "[tk8s-install] kto tk8s failed — check ~/tk logs."
+
+  # tk8s-post-boot.service: 第二次 boot（cloud-init reboot 後）才執行 tk8s 安裝。
+  # ConditionPathExists 確保只跑一次；After=network-online 保證 kto tk8s 拉 image 時網路 OK。
+  - path: /etc/systemd/system/tk8s-post-boot.service
     permissions: '0644'
     owner: root:root
     content: |
       [Unit]
-      Description=Restart serial-getty after cloud-init for clean dialog rendering
-      After=cloud-final.service
-      ConditionPathExists=!/var/lib/cloud/instance/.dialog-ready
+      Description=Install taroko k8s after first reboot
+      # 只 After network-online；不 After multi-user.target（會跟 WantedBy 衝突）。
+      # WantedBy=multi-user.target 已隱含這 service 是 multi-user 啟動流程的一部分。
+      After=network-online.target
+      Wants=network-online.target
+      ConditionPathExists=!/var/lib/.tk8s-installed
 
       [Service]
       Type=oneshot
       RemainAfterExit=yes
-      ExecStartPre=/bin/sleep 5
-      ExecStart=/bin/systemctl restart serial-getty@ttyS0.service
-      ExecStartPost=/bin/touch /var/lib/cloud/instance/.dialog-ready
+      TimeoutStartSec=0
+      ExecStart=/usr/local/bin/tk8s-install.sh
+      ExecStartPost=/bin/touch /var/lib/.tk8s-installed
+      StandardOutput=journal
+      StandardError=journal
 
       [Install]
       WantedBy=multi-user.target
@@ -542,12 +563,19 @@ runcmd:
   - systemctl disable --now ufw
   # ── SSH 重啟套用密碼登入設定 ────────────────────────────
   - systemctl restart ssh
-  # ── 載入 systemd 新單元（autologin override + dialog-ready service）──
-  # serial-getty 的 restart 不在這做：cloud-init 後續還會輸出大量訊息到
-  # /dev/console，會把 dialog 蓋掉。改由 dialog-ready.service 在
-  # cloud-final.service 完全結束後才重啟 ttyS0 getty。
+  # ── 載入 systemd 新單元（autologin override + tk8s-post-boot service）──
+  # serial-getty 不在 cloud-init 內 restart：等下面 power_state 觸發 reboot 後，
+  # 重新 boot 時 serial-getty 會自動帶 autologin override 起來，dialog 在乾淨環境出現。
+  # tk8s-post-boot.service 第二次 boot 才執行（kto tk8s 在 reboot 後跑更穩定）。
   - systemctl daemon-reload
-  - systemctl start --no-block dialog-ready.service
+  # 只在 ENABLE_TK8S=true 時 enable：避免 false 情況下每次 boot 都啟動 service 跑空腳本
+  - |
+    if [ "__ENABLE_TK8S__" = "true" ]; then
+        systemctl enable tk8s-post-boot.service
+        echo "[runcmd] tk8s-post-boot.service enabled (will run on reboot)"
+    else
+        echo "[runcmd] ENABLE_TK8S=false, skip tk8s-post-boot.service"
+    fi
   # ── xrdp via local installer (injected by generate_user_data) ──
   # Script must run as a normal user (it calls sudo internally)
   - su - __VM_USER__ -c "bash /tmp/xrdp-installer.sh"
@@ -590,9 +618,29 @@ runcmd:
   # ── Start qemu-guest-agent (installed via packages above, but udev event ──
   # already fired before install, so re-trigger to activate the service)
   - udevadm trigger --subsystem-match=virtio-ports
+  # ── 拿掉 SSH 登入時的 "*** System restart required ***" 提示 ───────
+  # package_upgrade 升級 kernel 後 /var/run/reboot-required 會被建立，
+  # /etc/update-motd.d/98-reboot-required 在每次 SSH 登入會檢查並印出該提示。
+  # chmod -x 而非 rm：避免 update-notifier-common 重裝/升級時重新建立。
+  - chmod -x /etc/update-motd.d/98-reboot-required || true
   # ── Cleanup ─────────────────────────────────────────────────
   - rm -f /tmp/xrdp-installer.sh /tmp/fix-xrdp-ini.sh /tmp/setup-xfce4-perf.sh /tmp/setup-ibus.sh /tmp/setup-podman-rootless.sh /tmp/setup-tools.sh
 
 final_message: |
-  tkcdc VM __VM_HOSTNAME__ is ready.
+  tkcdc VM __VM_HOSTNAME__ first-boot setup done. Rebooting to apply kernel updates
+  and finalize tk8s install (if enabled). Reconnect after reboot.
   User: __VM_USER__ | xRDP: enabled | Podman rootless: enabled
+
+# ------------------------------------------------------------
+# 第一次 boot 結束後自動 reboot：
+#  - 讓 package_upgrade 升級的 kernel 生效
+#  - 消除 SSH 登入時 "*** System restart required ***" 提示
+#  - 第二次 boot serial-getty 帶 autologin 在乾淨環境跑 dialog（不被 cloud-init log 干擾）
+#  - tk8s-post-boot.service 在乾淨環境執行 kto tk8s（如有 enable）
+# timeout: 30 秒緩衝讓 cloud-init 完成寫 log；condition: True 強制執行
+# ------------------------------------------------------------
+power_state:
+  mode: reboot
+  message: First-boot setup done, rebooting...
+  timeout: 30
+  condition: True
