@@ -283,6 +283,28 @@ write_files:
       tar xzf /tmp/cilium.tar.gz -C /usr/local/bin cilium
       rm -f /tmp/cilium.tar.gz
 
+      # ── dive (container image explorer) ─────────────────────────
+      echo "[setup-tools] Installing dive..."
+      DIVE_VERSION=$(curl -sL "https://api.github.com/repos/wagoodman/dive/releases/latest" \
+          | grep '"tag_name":' \
+          | sed -E 's/.*"v([^"]+)".*/\1/')
+      if [ -n "$DIVE_VERSION" ]; then
+          curl -fsL "https://github.com/wagoodman/dive/releases/download/v${DIVE_VERSION}/dive_${DIVE_VERSION}_linux_amd64.deb" \
+              -o /tmp/dive.deb \
+              && DEBIAN_FRONTEND=noninteractive apt-get install -y /tmp/dive.deb
+          rm -f /tmp/dive.deb
+      else
+          echo "[setup-tools] WARNING: failed to fetch dive version, skipping"
+      fi
+
+      # ── auger (etcd debug tool, Go-based) ───────────────────────
+      # 要用 su - 跑：go install 會放到 $HOME/go/bin（這裡是 /home/${USERNAME}/go/bin）。
+      # PATH 已在 tkcdc.sh 加入 $HOME/go/bin，使用者登入後直接 auger 就能用。
+      echo "[setup-tools] Installing auger..."
+      su - "$USERNAME" -c 'go install github.com/etcd-io/auger@latest' \
+          && echo "[setup-tools] auger installed." \
+          || echo "[setup-tools] auger install failed."
+
       # ── taroko package ───────────────────────────────────────────
       echo "[setup-tools] Downloading taroko package..."
       rm -rf "${HOME_DIR}/tk"
@@ -303,8 +325,10 @@ write_files:
       # 結尾驗證（沒 set -e 是故意的：希望單一下載失敗不要整個中斷，
       # 但要在 cloud-init log 留警告，事後可從 log 查哪些缺掉再手動補）
       echo "[setup-tools] Validating installations..."
-      [ -x /usr/local/bin/kubectl ] || echo "[setup-tools] WARNING: kubectl missing"
-      [ -x /usr/local/bin/cilium ]  || echo "[setup-tools] WARNING: cilium missing"
+      [ -x /usr/local/bin/kubectl ]      || echo "[setup-tools] WARNING: kubectl missing"
+      [ -x /usr/local/bin/cilium ]       || echo "[setup-tools] WARNING: cilium missing"
+      command -v dive &>/dev/null        || echo "[setup-tools] WARNING: dive missing"
+      [ -x "${HOME_DIR}/go/bin/auger" ]  || echo "[setup-tools] WARNING: auger missing"
       [ -d "${HOME_DIR}/cni" ] && [ -n "$(ls -A ${HOME_DIR}/cni 2>/dev/null)" ] \
           || echo "[setup-tools] WARNING: CNI plugins missing"
       [ -d "${HOME_DIR}/tk" ] || echo "[setup-tools] WARNING: taroko package missing"
@@ -322,11 +346,12 @@ write_files:
       export NETID=${IP%.*}
       export GW=$(route -n | grep -e '^0.0.0.0' | tr -s \ - | cut -d ' ' -f2)
       # Only prepend custom paths not already in PATH.
-      # $HOME/bin is intentionally excluded — ~/.profile already adds it unconditionally,
+      # $HOME/bin is intentionally excluded — ~/.profile already adds it unconditionally，
       # so including it here would cause duplication in xRDP sessions.
+      # $HOME/go/bin: go install 安裝的 binary（如 auger）會放這裡。
       case ":$PATH:" in
         *":$HOME/tk/bin:"*) ;;
-        *) export PATH="$HOME/tk/bin:$HOME/kind/bin:$PATH" ;;
+        *) export PATH="$HOME/tk/bin:$HOME/kind/bin:$HOME/go/bin:$PATH" ;;
       esac
 
       if [ ! -d $HOME/.kube ]; then
@@ -547,6 +572,7 @@ packages:
   - fonts-noto-cjk
   - jq
   - dialog
+  - golang-go
 
 # ------------------------------------------------------------
 # Run commands at first boot
