@@ -168,15 +168,9 @@ export VM_PASSWORD="bigred"
 export ENABLE_TK8S="false"   # 改為 "true" 自動初始化 k8s
 ```
 
-設為 `true` 後，cloud-init 完成 + reboot 後，systemd 服務 `tk8s-post-boot.service` 會在乾淨環境執行：
-
-```bash
-su - $VM_USER -c 'kto tk8s'
-```
+設為 `true` 後，cloud-init 完成 + reboot 後，systemd 服務會在乾淨環境執行 `kto tk8s`。
 
 > **為何 reboot 後才裝**：cloud-init 階段會升級 kernel，新 kernel 要 reboot 才生效。tk8s 在新 kernel 上跑比較穩定（特別是 br_netfilter / overlay 等模組）。
-
-執行 log 在 `journalctl -u tk8s-post-boot.service`。
 
 ---
 
@@ -322,12 +316,12 @@ VM 部署分**兩階段**：
   cloud-init 完成所有 setup（write_files / apt / runcmd）
         │
         ▼
-  power_state 觸發 reboot（30s 緩衝）
+  自動 reboot（讓 kernel 升級生效）
         │
         ▼
 第二次 boot
-  Kernel 升級生效；serial-getty 自動登入 → dialog 顯示
-  tk8s-post-boot.service 執行（如有 ENABLE_TK8S=true）
+  serial-getty 自動登入 → dialog 顯示
+  ENABLE_TK8S=true 時自動執行 kto tk8s
 ```
 
 ### 1. APT mirror 與穩定性設定
@@ -369,15 +363,7 @@ VM 部署分**兩階段**：
 - **安裝後驗證**：若 xrdp.service 不存在，用 `apt-get install -y --fix-missing` 重試 3 次
 - 套用效能調校：`crypt_level=low`、`max_bpp=24`、TCP buffer 32KB → 4MB
 
-### 6. xfce4 效能設定
-
-停用 xfwm4 Compositor（xRDP 卡頓最大主因）：
-```xml
-<property name="use_compositing" type="bool" value="false"/>
-<property name="vblank_mode" type="string" value="off"/>
-```
-
-### 7. IBus + 注音輸入法 + 右 Shift 切換
+### 6. IBus + 注音輸入法 + 右 Shift 切換
 
 - 寫入 `~/.xprofile`（最早載入）：
   ```bash
@@ -389,12 +375,12 @@ VM 部署分**兩階段**：
 - 設定 IBus：preload `xkb:us::eng`、`chewing`；切換熱鍵 `Shift_R`
 - 加 XFCE autostart：首次登入確認 `triggers` hotkey 並 `ibus restart`，執行完自刪
 
-### 8. PVE Console Autologin + Dialog
+### 7. PVE Console Autologin + Dialog
 
 - `/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf`：agetty 自動登入 `VM_USER`
 - `/etc/profile.d/zz-sinfo.sh`：登入後檢查 tty 是 `/dev/ttyS*` 才執行 dialog loop（其他 tty 跳過）
 
-### 9. Firefox（Mozilla PPA deb 版）
+### 8. Firefox（Mozilla PPA deb 版）
 
 Ubuntu 24.04 預設 Firefox 是 Snap 版，**Snap sandbox 在 xRDP session 內無法運作**。改用 Mozilla PPA：
 ```bash
@@ -403,17 +389,13 @@ apt-get install -y firefox || true
 ```
 `|| true` 避免 PPA 連不到時 cloud-init 整個 Error。
 
-### 10. Podman rootless
+### 9. Podman rootless
 
 - `loginctl enable-linger`
 - `/etc/subuid` + `/etc/subgid` 設定 `100000:65536`
 - 啟用 user-level `podman.socket`
 
-### 11. 拿掉 SSH 登入時的 reboot 提示
-
-`chmod -x /etc/update-motd.d/98-reboot-required` — package_upgrade 升 kernel 後不會在 SSH 登入時印 `*** System restart required ***`（auto reboot 已會處理 kernel 切換）。
-
-### 12. K8s 工具鏈 + 開發工具
+### 10. K8s 工具鏈 + 開發工具
 
 `/tmp/setup-tools.sh` 安裝：
 
@@ -428,7 +410,7 @@ apt-get install -y firefox || true
 
 腳本結尾驗證每項是否到位，缺漏的會在 cloud-init log 留 WARNING。
 
-### 13. Shell 環境（`/etc/profile.d/tkcdc.sh`）
+### 11. Shell 環境（`/etc/profile.d/tkcdc.sh`）
 
 | 設定 | 內容 |
 |------|------|
@@ -438,21 +420,6 @@ apt-get install -y firefox || true
 | 常用 alias | `docker` → `sudo podman`、`ping -c 4` 預設、`dir`、`poweroff/reboot` 等 |
 | kubectl completion | bash tab 補全自動載入 |
 | PS1 | 顯示目前 kubeconfig cluster 名稱 |
-
-### 14. Auto Reboot
-
-cloud-init 結尾 `power_state: reboot`：
-- 30 秒緩衝後 reboot
-- 讓 kernel 升級生效
-- 消除 SSH 登入時的 `*** System restart required ***`
-- 第二次 boot 時 dialog 在乾淨環境（無 cloud-init log 干擾）正確 render
-
-### 15. tk8s-post-boot.service（第二次 boot）
-
-- 條件：`ENABLE_TK8S=true` 才會 enable
-- After=`network-online.target`，等網路就緒才跑
-- ConditionPathExists=`!/var/lib/.tk8s-installed`，只跑一次
-- TimeoutStartSec=0，避免 systemd 預設 90s timeout 砍掉長時間安裝
 
 ---
 
@@ -714,19 +681,8 @@ qm guest cmd <VMID> ping
 ### tk8s 沒裝起來
 
 ```bash
-# 確認 service 有 enable
-systemctl is-enabled tk8s-post-boot.service
-
-# 看執行 log
-journalctl -u tk8s-post-boot.service -n 100
-
-# 確認 marker
-ls /var/lib/.tk8s-installed
-
-# 強制重新跑（先清 marker）
-sudo rm /var/lib/.tk8s-installed
-sudo systemctl start tk8s-post-boot.service
-journalctl -u tk8s-post-boot.service -f
+# 在 VM 內手動執行
+kto tk8s
 ```
 
 ### auger 找不到指令
@@ -758,4 +714,4 @@ ssh-copy-id root@<節點IP>
 - `VM_PASSWORD` 以**明文**存放於 cloud-init YAML（`/var/lib/vz/snippets/`），建議部署完修改密碼
 - xRDP 設 `crypt_level=low` 適合**內網環境**，外部網路請調高加密等級
 - **PVE Console 是 kiosk dialog**：要互動 shell 必須走 SSH 或 xRDP terminal
-- 對 cloud-init 重跑：`sudo cloud-init clean --logs && sudo reboot`（會重新執行所有設定，但 `tk8s-post-boot` 等 marker file 不在 cloud-init 管理範圍，需手動清）
+- 對 cloud-init 重跑：`sudo cloud-init clean --logs && sudo reboot`（會重新執行所有設定）
