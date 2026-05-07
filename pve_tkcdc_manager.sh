@@ -547,6 +547,53 @@ cmd_stop() {
     done
 }
 
+# ── SNAPSHOT all VMs ──────────────────────────────────────────
+# 對每台 VM 逐步執行 qm snapshot。Snapshot 名稱：
+#   - 第一個參數提供 → 使用該名稱
+#   - 否則 → 自動產生：snap-YYYYMMDD-HHMMSS
+# 中間顯示 [idx/total] 進度，最後彙整 success/failed 數量。
+cmd_snapshot() {
+    local snap_name="${1:-snap-$(date +%Y%m%d-%H%M%S)}"
+
+    # PVE snapshot 命名規則：^[A-Za-z][A-Za-z0-9_-]+$（2+ 字元，連字號/底線可）
+    if ! [[ "$snap_name" =~ ^[A-Za-z][A-Za-z0-9_-]+$ ]]; then
+        error "Invalid snapshot name '${snap_name}'. Must match ^[A-Za-z][A-Za-z0-9_-]+$"
+    fi
+
+    stage "Snapshot VMs"
+    info "Snapshot name: ${snap_name}"
+
+    load_vm_locations
+
+    read -r -p "Snapshot ${VM_COUNT} VM(s) with name '${snap_name}'? [y/N] " confirm
+    [[ "${confirm,,}" == "y" ]] || { info "Aborted."; exit 0; }
+
+    local idx=0 total=${#VM_LIST[@]}
+    local ok=0 fail=0
+    for entry in "${VM_LIST[@]}"; do
+        idx=$(( idx + 1 ))
+        IFS=':' read -r vmid hostname ip node <<< "$entry"
+
+        local actual_node
+        if ! actual_node=$(find_vm_node "$vmid"); then
+            warn "[${idx}/${total}] VM ${vmid} (${hostname}) not found, skipping"
+            fail=$(( fail + 1 ))
+            continue
+        fi
+
+        info "[${idx}/${total}] Snapshot VM ${vmid} (${hostname}) on [${actual_node}] → ${snap_name}"
+        if run_on_node "$actual_node" "qm snapshot ${vmid} ${snap_name}"; then
+            log "[${idx}/${total}] snapshot vm ${vmid} success"
+            ok=$(( ok + 1 ))
+        else
+            warn "[${idx}/${total}] failed to snapshot vm ${vmid}"
+            fail=$(( fail + 1 ))
+        fi
+    done
+
+    log "Snapshot done: ${ok} success, ${fail} failed (name: ${snap_name})"
+}
+
 # ── DELETE all VMs ────────────────────────────────────────────
 cmd_delete() {
     stage "Delete VMs"
@@ -723,12 +770,13 @@ ${BOLD}Proxmox tkcdc Manager${NC}
 Usage: bash $(basename "$0") <command>
 
 Commands:
-  ${GREEN}create${NC}          Download image, create & configure all VMs
-  ${GREEN}start${NC}           Start all VMs
-  ${GREEN}stop${NC}            Stop all VMs
-  ${GREEN}delete${NC}          Stop & permanently delete all VMs
-  ${GREEN}status${NC}          Show running status of all VMs
-  ${GREEN}select-storage${NC}  Interactive storage selector (updates env.conf)
+  ${GREEN}create${NC}            Download image, create & configure all VMs
+  ${GREEN}start${NC}             Start all VMs (skips already-running)
+  ${GREEN}stop${NC}              Stop all VMs (skips already-stopped)
+  ${GREEN}delete${NC}            Stop & permanently delete all VMs
+  ${GREEN}status${NC}            Show running status of all VMs
+  ${GREEN}snapshot${NC} [NAME]   Snapshot all VMs sequentially (auto timestamp if no NAME)
+  ${GREEN}select-storage${NC}    Interactive storage selector (updates env.conf)
 
 Edit ${CYAN}env.conf${NC} to change VM count, specs, IPs, nodes, and storage.
 "
@@ -738,7 +786,7 @@ Edit ${CYAN}env.conf${NC} to change VM count, specs, IPs, nodes, and storage.
 main() {
     # Truncate logs only for state-changing commands, not for status/select-storage
     case "${1:-}" in
-        create|start|stop|delete) : > "$LOG_FILE"; : > "$EXEC_LOG" ;;
+        create|start|stop|delete|snapshot) : > "$LOG_FILE"; : > "$EXEC_LOG" ;;
     esac
 
     load_config
@@ -750,6 +798,7 @@ main() {
         stop)           cmd_stop ;;
         delete)         cmd_delete ;;
         status)         cmd_status ;;
+        snapshot)       cmd_snapshot "${2:-}" ;;
         select-storage) cmd_select_storage ;;
         *)              usage; exit 1 ;;
     esac

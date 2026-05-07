@@ -32,6 +32,7 @@
 - **增量部署**：`VMID_END` 增加後重跑 `create` 會自動跳過已存在 VM，只建立差集
 - **衝突預檢**：建立前自動偵測 IP 是否被佔用（已存在 VMID 視為要 skip 的合法狀態）
 - **冪等的 start/stop**：對已是目標狀態的 VM 自動跳過，不誤報失敗
+- **批次 Snapshot**：`snapshot` 指令逐台 snapshot 所有 VM（支援自訂名稱或自動 timestamp）
 - **APT 鏡像**：使用 NCHC 國網中心鏡像 + IPv4-only + retry 強化，避免 archive.ubuntu.com 不穩定造成安裝失敗
 - **全自動初始化**：cloud-init 完成所有軟體安裝、IBus 中文輸入、xRDP、Podman、k8s 工具
 - **自動 reboot**：cloud-init 完成後自動重啟，讓 kernel 升級生效，並在乾淨環境執行 tk8s
@@ -247,7 +248,7 @@ ssh bigred@192.168.61.31
 ## 指令說明
 
 ```bash
-bash pve_tkcdc_manager.sh <指令>
+bash pve_tkcdc_manager.sh <指令> [參數]
 ```
 
 | 指令 | 說明 |
@@ -257,9 +258,23 @@ bash pve_tkcdc_manager.sh <指令>
 | `stop` | 關閉所有 VM（已 stopped 跳過） |
 | `delete` | 停止並永久刪除所有 VM 與磁碟 |
 | `status` | 顯示所有 VM 目前狀態與 cloud-init 進度 |
+| `snapshot [NAME]` | 逐台 snapshot 所有 VM（沒帶 NAME 時自動產生 timestamp） |
 | `select-storage` | 互動式 Storage 選擇器（自動更新 `env.conf`） |
 
 > `delete` 指令需輸入 `yes` 才會執行。
+
+### Snapshot 範例
+
+```bash
+# 自動命名（範例：snap-20260507-143025）
+bash pve_tkcdc_manager.sh snapshot
+
+# 自訂名稱（用於版本標記）
+bash pve_tkcdc_manager.sh snapshot before-upgrade
+bash pve_tkcdc_manager.sh snapshot baseline-2026
+```
+
+Snapshot 名稱必須符合 PVE 格式：`^[A-Za-z][A-Za-z0-9_-]+$`（字母開頭、長度 ≥ 2、僅含英數/底線/連字號）。逐台處理，會顯示 `[idx/total]` 進度，最後彙整成功/失敗數量。
 
 ---
 
