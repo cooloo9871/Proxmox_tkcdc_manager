@@ -27,7 +27,12 @@ stage()  { echo -e "\n${BOLD}[Stage: $*]${NC}" | tee -a "$LOG_FILE"; }
 declare -A NODE_IP_MAP
 
 # ── VM location cache: VMID → actual node (filled by load_vm_locations) ─
-declare -A _VM_NODE_CACHE
+# 顯式初始化 =()：bash + set -u 對沒 assign 過的 array 取 ${#arr[@]} 會 unbound error
+declare -A _VM_NODE_CACHE=()
+
+# ── Existing VM detection (filled by check_conflicts during create) ─
+# vmid → node where it already exists; 用來在 incremental create 時跳過
+declare -A _VM_EXISTS=()
 
 # ── Resolve node SSH target: IP if in NODE_IP_MAP, else name ─
 node_addr() { echo "${NODE_IP_MAP[${1}]:-${1}}"; }
@@ -46,6 +51,21 @@ for vm in json.loads(sys.stdin.read()):
     if vmid and node:
         print(vmid + '\t' + node)
 " <<< "$json" 2>/dev/null)
+}
+
+# ── Get current power state of a VM on the given node ───────
+# 回傳 "running" / "stopped" / "" (查不到)。給 cmd_start/cmd_stop 用來
+# 在執行 qm start/stop 前先判斷，避免對已經是目標狀態的 VM 重複操作。
+vm_power_state() {
+    local vmid="$1"
+    local node="$2"
+    if [[ "$node" == "$EXECUTE_NODE" ]]; then
+        qm status "$vmid" 2>/dev/null | awk '{print $2}'
+    else
+        ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
+            "root@$(node_addr "$node")" \
+            "qm status ${vmid} 2>/dev/null | awk '{print \$2}'" 2>/dev/null
+    fi
 }
 
 # ── Find the node currently hosting a VM ─────────────────────
@@ -117,20 +137,37 @@ build_vm_list() {
 }
 
 # ── Pretty-print the planned VM list ─────────────────────────
-# If _VM_NODE_CACHE is populated (e.g. during delete), the NODE column
-# reflects the actual current node; a trailing (*) marks migrated VMs.
+# 用 context 參數明確區分：
+#   "create" → 不存在的標 "new"  （cmd_create 會建立）
+#   "delete" → 不存在的標 "missing"（cmd_delete 會跳過）
+# 已存在的一律顯示 "exists"。NODE 欄位：實際節點與規劃不符顯示 actual(*)。
 print_vm_plan() {
+    local context="${1:-create}"
     echo -e "\n${BOLD}  VM Deployment Plan (${VM_COUNT} VMs across ${NODE_COUNT} nodes)${NC}"
-    echo -e "  ${CYAN}$(printf '%-8s %-18s %-18s %-14s' VMID HOSTNAME IP NODE)${NC}"
-    echo "  $(printf '%0.s─' {1..60})"
+    echo -e "  ${CYAN}$(printf '%-8s %-18s %-18s %-14s %-10s' VMID HOSTNAME IP NODE STATUS)${NC}"
+    echo "  $(printf '%0.s─' {1..76})"
     for entry in "${VM_LIST[@]}"; do
         IFS=':' read -r vmid hostname ip node <<< "$entry"
         local display_node="$node"
-        if [[ -v _VM_NODE_CACHE["$vmid"] ]]; then
+        local status
+
+        if [[ -v _VM_EXISTS["$vmid"] ]]; then
+            # create 流程：check_conflicts 已偵測到此 VM 存在
+            local on="${_VM_EXISTS[$vmid]}"
+            [[ "$on" != "$node" ]] && display_node="${on}(*)" || display_node="$on"
+            status="exists"
+        elif [[ -v _VM_NODE_CACHE["$vmid"] ]]; then
+            # delete/start/stop 流程：load_vm_locations 找到此 VM
             local cached="${_VM_NODE_CACHE[$vmid]}"
             [[ "$cached" != "$node" ]] && display_node="${cached}(*)" || display_node="$cached"
+            status="exists"
+        elif [[ "$context" == "delete" ]]; then
+            status="missing"
+        else
+            status="new"
         fi
-        echo "  $(printf '%-8s %-18s %-18s %-14s' "$vmid" "$hostname" "$ip" "$display_node")"
+
+        echo "  $(printf '%-8s %-18s %-18s %-14s %-10s' "$vmid" "$hostname" "$ip" "$display_node" "$status")"
     done
     echo ""
 }
@@ -160,38 +197,37 @@ check_env() {
     log "Check Environment Success"
 }
 
-# ── Pre-flight: detect VMID and IP conflicts before any VM is created ──
+# ── Pre-flight: detect existing VMs (skip in create) and IP conflicts (real ones only) ──
+# 已存在的 VMID 不算錯誤——標記到 _VM_EXISTS 讓 cmd_create 跳過。
+# 只有「IP 被用、但對應的 VMID 不是我們已記錄的」才算真衝突。
 check_conflicts() {
-    stage "Conflict Check (VMID & IP)"
+    stage "Conflict Check (existing VMs & IP)"
 
+    _VM_EXISTS=()
     local conflicts=0
 
     for entry in "${VM_LIST[@]}"; do
         IFS=':' read -r vmid hostname ip node <<< "$entry"
 
-        # ── VMID conflict: scan ALL nodes (not just assigned one) ──
-        local vmid_exists=false
+        # ── 偵測 VMID 是否已存在（任一節點）──
         local found_on=""
         for check_node in "${NODE_LIST[@]}"; do
             if [[ "$check_node" == "$EXECUTE_NODE" ]]; then
-                if qm status "$vmid" &>/dev/null; then
-                    vmid_exists=true; found_on="$check_node"; break
-                fi
+                qm status "$vmid" &>/dev/null && { found_on="$check_node"; break; }
             else
-                if ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
+                ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
                     "root@$(node_addr "$check_node")" \
-                    "qm status ${vmid}" &>/dev/null; then
-                    vmid_exists=true; found_on="$check_node"; break
-                fi
+                    "qm status ${vmid}" &>/dev/null && { found_on="$check_node"; break; }
             fi
         done
 
-        if $vmid_exists; then
-            warn "VMID ${vmid} (${hostname}) already exists on node [${found_on}]"
-            conflicts=$(( conflicts + 1 ))
+        if [[ -n "$found_on" ]]; then
+            # VMID 已存在：標記為 skip，繼續下一個（不檢查 IP，自己 IP 必然有回應）
+            _VM_EXISTS["$vmid"]="$found_on"
+            continue
         fi
 
-        # ── IP conflict: ping to see if anything already holds this IP ──
+        # ── IP 衝突檢查：只對「不存在的 VM」進行 ──
         if ping -c 1 -W 1 "$ip" &>/dev/null; then
             warn "IP ${ip} (${hostname}) is already in use on the network"
             conflicts=$(( conflicts + 1 ))
@@ -199,10 +235,16 @@ check_conflicts() {
     done
 
     if [[ $conflicts -gt 0 ]]; then
-        error "Found ${conflicts} conflict(s). Resolve them or adjust VMID_START / VM_IP_START in env.conf before retrying."
+        error "Found ${conflicts} IP conflict(s). Resolve them or adjust VM_IP_START in env.conf."
     fi
 
-    log "No conflicts found — all VMIDs and IPs are free"
+    local existing=${#_VM_EXISTS[@]}
+    local to_create=$(( VM_COUNT - existing ))
+    if [[ $existing -gt 0 ]]; then
+        log "Pre-flight OK: ${existing} VM(s) already exist (will skip), ${to_create} new to create"
+    else
+        log "Pre-flight OK: all ${VM_COUNT} VMIDs and IPs are free"
+    fi
 }
 
 # ── Download Ubuntu cloud image (once) ───────────────────────
@@ -405,28 +447,48 @@ create_vm() {
     log "create vm ${vmid} (${hostname}) on ${node} success"
 }
 
-# ── CREATE all VMs ─────────────────────────────────────────────
+# ── CREATE VMs (incremental: skip existing, only create new) ──────────
+# 支援增量建立：擴大 VMID_END 後重跑 create，已存在的 VMID 自動跳過，
+# 只建立差集中的新 VM。
 cmd_create() {
     check_env
-    check_conflicts
-    download_image
+    check_conflicts        # 偵測現有 VM 並標記到 _VM_EXISTS（不報錯）
 
     stage "Create VMs"
-    print_vm_plan
+    print_vm_plan create
 
-    read -r -p "Proceed to create ${VM_COUNT} VM(s)? [y/N] " confirm
+    local existing=${#_VM_EXISTS[@]}
+    local to_create=$(( VM_COUNT - existing ))
+
+    if [[ $to_create -le 0 ]]; then
+        log "All ${VM_COUNT} VMs in the planned range already exist — nothing to create"
+        info "To recreate, delete the relevant VMs first."
+        exit 0
+    fi
+
+    download_image
+
+    if [[ $existing -gt 0 ]]; then
+        info "${existing} VM(s) already exist (will skip); creating ${to_create} new VM(s)"
+    fi
+    read -r -p "Proceed to create ${to_create} new VM(s)? [y/N] " confirm
     [[ "${confirm,,}" == "y" ]] || { info "Aborted."; exit 0; }
 
     for entry in "${VM_LIST[@]}"; do
         IFS=':' read -r vmid hostname ip node <<< "$entry"
+        if [[ -v _VM_EXISTS["$vmid"] ]]; then
+            info "Skipping VM ${vmid} (${hostname}) — already exists on [${_VM_EXISTS[$vmid]}]"
+            continue
+        fi
         create_vm "$vmid" "$hostname" "$ip" "$node"
     done
 
-    log "All ${VM_COUNT} VMs created successfully"
+    log "Created ${to_create} new VM(s); ${existing} existing skipped"
     info "Run: bash pve_tkcdc_manager.sh start"
 }
 
 # ── START all VMs ─────────────────────────────────────────────
+# 已 running 的跳過，避免 qm start 對已開機 VM 報錯而誤判為失敗。
 cmd_start() {
     stage "Start VMs"
     load_vm_locations
@@ -437,7 +499,15 @@ cmd_start() {
             warn "VM ${vmid} (${hostname}) not found on any node, skipping"
             continue
         fi
-        [[ "$actual_node" != "$node" ]] &&             info "VM ${vmid} has migrated: ${node} → ${actual_node}"
+        [[ "$actual_node" != "$node" ]] && info "VM ${vmid} has migrated: ${node} → ${actual_node}"
+
+        local vm_state
+        vm_state=$(vm_power_state "$vmid" "$actual_node")
+        if [[ "$vm_state" == "running" ]]; then
+            info "VM ${vmid} (${hostname}) is already running on [${actual_node}], skipping"
+            continue
+        fi
+
         info "Starting VM ${vmid} (${hostname}) on [${actual_node}]"
         if run_on_node "$actual_node" "qm start ${vmid}"; then
             log "start vm ${vmid} success"
@@ -448,6 +518,7 @@ cmd_start() {
 }
 
 # ── STOP all VMs ──────────────────────────────────────────────
+# 已 stopped 的跳過，理由同 cmd_start。
 cmd_stop() {
     stage "Stop VMs"
     load_vm_locations
@@ -458,7 +529,15 @@ cmd_stop() {
             warn "VM ${vmid} (${hostname}) not found on any node, skipping"
             continue
         fi
-        [[ "$actual_node" != "$node" ]] &&             info "VM ${vmid} has migrated: ${node} → ${actual_node}"
+        [[ "$actual_node" != "$node" ]] && info "VM ${vmid} has migrated: ${node} → ${actual_node}"
+
+        local vm_state
+        vm_state=$(vm_power_state "$vmid" "$actual_node")
+        if [[ "$vm_state" == "stopped" ]]; then
+            info "VM ${vmid} (${hostname}) is already stopped on [${actual_node}], skipping"
+            continue
+        fi
+
         info "Stopping VM ${vmid} (${hostname}) on [${actual_node}]"
         if run_on_node "$actual_node" "qm stop ${vmid}"; then
             log "stop vm ${vmid} completed"
@@ -473,7 +552,7 @@ cmd_delete() {
     stage "Delete VMs"
 
     load_vm_locations
-    print_vm_plan
+    print_vm_plan delete
     echo -e "${RED}WARNING: This will permanently delete all ${VM_COUNT} VMs and their disks!${NC}"
     read -r -p "Type 'yes' to confirm deletion: " confirm
     [[ "$confirm" == "yes" ]] || { info "Aborted."; exit 0; }
@@ -560,12 +639,9 @@ fi'
         local vm_state
         if [[ -z "$actual_node" ]]; then
             vm_state="not found"
-        elif [[ "$actual_node" == "$EXECUTE_NODE" ]]; then
-            vm_state=$(qm status "$vmid" 2>/dev/null | awk '{print $2}' || echo "unknown")
         else
-            vm_state=$(ssh -n -o BatchMode=yes -o ConnectTimeout=3 \
-                "root@$(node_addr "$actual_node")" \
-                "qm status ${vmid} 2>/dev/null | awk '{print \$2}'" 2>/dev/null || echo "unknown")
+            vm_state=$(vm_power_state "$vmid" "$actual_node")
+            [[ -z "$vm_state" ]] && vm_state="unknown"
         fi
 
         # ── Cloud-init progress (guest agent → SSH fallback) ────
