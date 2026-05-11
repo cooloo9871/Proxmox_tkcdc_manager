@@ -573,6 +573,7 @@ packages:
   - jq
   - dialog
   - golang-go
+  - mariadb-client-core
 
 # ------------------------------------------------------------
 # Run commands at first boot

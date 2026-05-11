@@ -370,6 +370,7 @@ VM 部署分**兩階段**：
 | Container | `podman`、`dbus-user-session`、`slirp4netns`、`uidmap` |
 | PVE 整合 | `qemu-guest-agent` |
 | 開發工具 | `golang-go`、`jq`、`dialog` |
+| 資料庫 client | `mariadb-client-core`（`mysql` / `mariadb` CLI，無 server） |
 | 常用 | `curl`、`wget`、`unzip`、`net-tools` |
 
 ### 5. xRDP 安裝與設定
