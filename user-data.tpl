@@ -395,7 +395,7 @@ write_files:
       alias pc='sudo podman system prune -a -f; sudo podman volume rm -a -f'
       alias vms='sudo /usr/bin/vmware-toolbox-cmd disk shrink /'
       [ -r /usr/share/bash-completion/bash_completion ] && source /usr/share/bash-completion/bash_completion
-      command -v kubectl &>/dev/null && source <(kubectl completion bash) || true
+      command -v kubectl &>/dev/null && source <(kubectl completion bash) && complete -o default -F __start_kubectl k || true
 
   # /etc/profile.d/zz-sinfo.sh — 在 PVE Console (serial /dev/ttyS*) 登入時用 dialog
   # 顯示 VM 資訊（Hostname / Memory / CPU / Disk / IP / Gateway / DNS）。
