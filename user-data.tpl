@@ -574,6 +574,7 @@ packages:
   - dialog
   - golang-go
   - mariadb-client-core
+  - mbw
 
 # ------------------------------------------------------------
 # Run commands at first boot
