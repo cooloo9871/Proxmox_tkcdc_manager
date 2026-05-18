@@ -675,40 +675,45 @@ fi'
     echo "  $(printf '%0.s─' {1..92})"
 
     load_vm_locations
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    # ── 每台 VM 平行檢查，結果寫入 tmpdir/$vmid ──────────────
     for entry in "${VM_LIST[@]}"; do
         IFS=':' read -r vmid hostname ip node <<< "$entry"
-        local actual_node
-        actual_node=$(find_vm_node "$vmid") || actual_node=""
-        local display_node="$actual_node"
-        [[ -n "$actual_node" && "$actual_node" != "$node" ]] &&             display_node="${actual_node}(*)"
+        (
+            actual_node=$(find_vm_node "$vmid") || actual_node=""
+            display_node="$actual_node"
+            [[ -n "$actual_node" && "$actual_node" != "$node" ]] && \
+                display_node="${actual_node}(*)"
 
-        # ── VM power state ──────────────────────────────────────
-        local vm_state
-        if [[ -z "$actual_node" ]]; then
-            vm_state="not found"
-        else
-            vm_state=$(vm_power_state "$vmid" "$actual_node")
-            [[ -z "$vm_state" ]] && vm_state="unknown"
-        fi
-
-        # ── Cloud-init progress (guest agent → SSH fallback) ────
-        local ci_label="—"
-        if [[ "$vm_state" == "running" ]]; then
-            local ga_raw="" ga_out=""
-
-            # Try 1: qm guest exec (requires qemu-guest-agent running inside VM)
-            if [[ "$actual_node" == "$EXECUTE_NODE" ]]; then
-                ga_raw=$(qm guest exec "$vmid" --timeout 10 -- \
-                    bash -c "echo ${script_b64} | base64 -d | bash" 2>/dev/null || true)
+            # ── VM power state ──────────────────────────────────
+            if [[ -z "$actual_node" ]]; then
+                vm_state="not found"
             else
-                ga_raw=$(ssh -n -o BatchMode=yes -o ConnectTimeout=15 \
-                    "root@$(node_addr "$actual_node")" \
-                    "qm guest exec ${vmid} --timeout 10 -- bash -c 'echo ${script_b64} | base64 -d | bash'" \
-                    2>/dev/null || true)
+                vm_state=$(vm_power_state "$vmid" "$actual_node")
+                [[ -z "$vm_state" ]] && vm_state="unknown"
             fi
 
-            # Parse JSON output from qm guest exec
-            ga_out=$(printf '%s' "$ga_raw" | python3 -c "
+            # ── Cloud-init progress (guest agent → SSH fallback) ─
+            ci_label="—"
+            if [[ "$vm_state" == "running" ]]; then
+                ga_raw="" ga_out=""
+
+                # Try 1: qm guest exec (requires qemu-guest-agent running inside VM)
+                if [[ "$actual_node" == "$EXECUTE_NODE" ]]; then
+                    ga_raw=$(qm guest exec "$vmid" --timeout 5 -- \
+                        bash -c "echo ${script_b64} | base64 -d | bash" 2>/dev/null || true)
+                else
+                    ga_raw=$(ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
+                        "root@$(node_addr "$actual_node")" \
+                        "qm guest exec ${vmid} --timeout 5 -- bash -c 'echo ${script_b64} | base64 -d | bash'" \
+                        2>/dev/null || true)
+                fi
+
+                # Parse JSON output from qm guest exec
+                ga_out=$(printf '%s' "$ga_raw" | python3 -c "
 import sys, json
 try:
     print(json.load(sys.stdin).get('out-data','').strip())
@@ -716,49 +721,58 @@ except:
     pass
 " 2>/dev/null || true)
 
-            # Try 2: SSH fallback (sshpass) if guest agent not responding
-            if [[ -z "$ga_out" ]] && command -v sshpass &>/dev/null; then
-                # Check SSH port first; if closed the VM is still booting
-                if ! timeout 3 bash -c "echo >/dev/tcp/${ip}/22" 2>/dev/null; then
-                    ci_label="Booting..."
-                else
-                    ga_out=$(sshpass -p "${VM_PASSWORD}" \
-                        ssh -n \
-                        -o StrictHostKeyChecking=no \
-                        -o ConnectTimeout=5 \
-                        -o IdentitiesOnly=yes \
-                        -o PubkeyAuthentication=no \
-                        -o PreferredAuthentications=password,keyboard-interactive \
-                        -o NumberOfPasswordPrompts=1 \
-                        "${VM_USER}@${ip}" \
-                        "$(printf '%s' "$_check_script")" 2>/dev/null || true)
+                # Try 2: SSH fallback (sshpass) if guest agent not responding
+                if [[ -z "$ga_out" ]] && command -v sshpass &>/dev/null; then
+                    # Check SSH port first; if closed the VM is still booting
+                    if ! timeout 2 bash -c "echo >/dev/tcp/${ip}/22" 2>/dev/null; then
+                        ci_label="Booting..."
+                    else
+                        ga_out=$(sshpass -p "${VM_PASSWORD}" \
+                            ssh -n \
+                            -o StrictHostKeyChecking=no \
+                            -o ConnectTimeout=5 \
+                            -o IdentitiesOnly=yes \
+                            -o PubkeyAuthentication=no \
+                            -o PreferredAuthentications=password,keyboard-interactive \
+                            -o NumberOfPasswordPrompts=1 \
+                            "${VM_USER}@${ip}" \
+                            "$(printf '%s' "$_check_script")" 2>/dev/null || true)
+                    fi
+                fi
+
+                if [[ -z "$ci_label" || "$ci_label" == "—" ]]; then
+                    case "$ga_out" in
+                        DONE)    ci_label="Ready" ;;
+                        ERROR)   ci_label="Error" ;;
+                        RUNNING) ci_label="Waiting..." ;;
+                        NOCLI)   ci_label="No cloud-init" ;;
+                        "")      ci_label="Agent N/A" ;;
+                        *)       ci_label="Unknown" ;;
+                    esac
                 fi
             fi
 
-            if [[ -z "$ci_label" || "$ci_label" == "—" ]]; then
-                case "$ga_out" in
-                    DONE)    ci_label="Ready" ;;
-                    ERROR)   ci_label="Error" ;;
-                    RUNNING) ci_label="Waiting..." ;;
-                    NOCLI)   ci_label="No cloud-init" ;;
-                    "")      ci_label="Agent N/A" ;;
-                    *)       ci_label="Unknown" ;;
-                esac
-            fi
-        fi
+            # ── Colorize ────────────────────────────────────────
+            color="$NC"
+            case "$ci_label" in
+                Ready)                                color="$GREEN"  ;;
+                Error)                                color="$RED"    ;;
+                "Agent N/A"|"No cloud-init"|Unknown)  color="$YELLOW" ;;
+            esac
 
-        # ── Colorize ────────────────────────────────────────────
-        local color="$NC"
-        case "$ci_label" in
-            Ready)                                color="$GREEN"  ;;
-            Error)                                color="$RED"    ;;
-            "Agent N/A"|"No cloud-init"|Unknown)  color="$YELLOW" ;;
-        esac
-
-        printf "  %-8s %-18s %-18s %-14s %-10s " \
-            "$vmid" "$hostname" "$ip" "$display_node" "$vm_state"
-        echo -e "${color}${ci_label}${NC}"
+            printf "  %-8s %-18s %-18s %-14s %-10s " \
+                "$vmid" "$hostname" "$ip" "$display_node" "$vm_state"
+            echo -e "${color}${ci_label}${NC}"
+        ) > "$tmpdir/$vmid" &
     done
+
+    # ── 等所有背景工作完成，依序印出結果 ────────────────────
+    wait
+    for entry in "${VM_LIST[@]}"; do
+        IFS=':' read -r vmid _ _ _ <<< "$entry"
+        cat "$tmpdir/$vmid" 2>/dev/null || true
+    done
+    rm -rf "$tmpdir"
     echo ""
 }
 
