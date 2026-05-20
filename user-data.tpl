@@ -407,6 +407,11 @@ write_files:
     content: |
       #!/bin/bash
       if [[ "$(tty 2>/dev/null)" == /dev/ttyS* ]] && [ -z "$SSH_TTY" ]; then
+          if [ -n "$_CONSOLE_ACTIVE" ]; then
+              # exec bash -l 帶入的子 shell：跳過 dialog，直接給提示符
+              # 使用者 exit 後 agetty autologin 重新觸發，新 session 沒有此旗標
+              return
+          fi
           # cloud-init boot 期間大量 log 輸出到 ttyS0，會把終端狀態搞亂導致
           # dialog (ncurses) 無法正確 render。先 reset 清掉 cloud-init 殘留再畫 dialog。
           reset
@@ -456,21 +461,30 @@ write_files:
           }
 
           # 明確算出置中座標（dialog 在 PVE xterm.js 下預設置中有時失準）
-          DH=20; DW=78
+          DH=22; DW=78
           read TR TC < <(stty size 2>/dev/null || echo "25 80")
           BY=$(( (TR - DH) / 2 )); [ "$BY" -lt 0 ] && BY=0
           BX=$(( (TC - DW) / 2 )); [ "$BX" -lt 0 ] && BX=0
 
-          # 每次 iteration 重新生成 /tmp/sinfo + 重畫 dialog：
-          # - tk8s-post-boot.service 完成後 Kubernetes 狀態會自動反映
-          # - PVE Console 切換/重連時 xterm.js 會重建終端緩衝，新的 dialog process
-          #   ncurses initscr 重新做完整繪製，最多 2 秒重新出現
-          # 注意：此模式下 PVE Console 變 kiosk，無法進 bash；要 shell 請用 SSH 或 xRDP。
+          # 顯示 VM 資訊並等待 Enter：
+          # - 每 5 秒刷新一次（反映 tk8s-post-boot.service 完成後的 Kubernetes 狀態）
+          # - 按下任意鍵 → 離開 dialog，shell 繼續執行（顯示正常提示符）
+          # - 使用者 exit 後 autologin 重新觸發，再次顯示資訊畫面
           while true; do
               gen_sinfo
-              dialog --begin $BY $BX --title " Cloud Native Trainer " --infobox "$(cat /tmp/sinfo)" $DH $DW
-              sleep 2
+              printf '\nPress ENTER to open terminal...' >> /tmp/sinfo
+              dialog --begin $BY $BX --title " Cloud Native Trainer " \
+                  --infobox "$(cat /tmp/sinfo)" $DH $DW
+              if read -t 5 -s -n 1 2>/dev/null; then
+                  break
+              fi
           done
+          clear
+          # 用 exec 替換目前的 login shell：
+          # - _CONSOLE_ACTIVE=1 讓新 bash -l 源入 zz-sinfo.sh 時跳過 dialog
+          # - 使用者 exit 後 agetty autologin 重觸發，新 session 無此旗標 → dialog 再次出現
+          export _CONSOLE_ACTIVE=1
+          exec bash -l
       fi
 
   # serial-getty 自動登入：PVE Console (Serial terminal 0) 開啟後直接登入 __VM_USER__，
