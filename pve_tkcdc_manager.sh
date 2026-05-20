@@ -703,12 +703,12 @@ fi'
 
                 # Try 1: qm guest exec (requires qemu-guest-agent running inside VM)
                 if [[ "$actual_node" == "$EXECUTE_NODE" ]]; then
-                    ga_raw=$(qm guest exec "$vmid" --timeout 5 -- \
+                    ga_raw=$(qm guest exec "$vmid" --timeout 10 -- \
                         bash -c "echo ${script_b64} | base64 -d | bash" 2>/dev/null || true)
                 else
                     ga_raw=$(ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
                         "root@$(node_addr "$actual_node")" \
-                        "qm guest exec ${vmid} --timeout 5 -- bash -c 'echo ${script_b64} | base64 -d | bash'" \
+                        "qm guest exec ${vmid} --timeout 10 -- bash -c 'echo ${script_b64} | base64 -d | bash'" \
                         2>/dev/null || true)
                 fi
 
@@ -730,6 +730,7 @@ except:
                         ga_out=$(sshpass -p "${VM_PASSWORD}" \
                             ssh -n \
                             -o StrictHostKeyChecking=no \
+                            -o UserKnownHostsFile=/dev/null \
                             -o ConnectTimeout=5 \
                             -o IdentitiesOnly=yes \
                             -o PubkeyAuthentication=no \

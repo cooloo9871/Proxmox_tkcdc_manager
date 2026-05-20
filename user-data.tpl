@@ -492,16 +492,34 @@ write_files:
       #!/bin/bash
       ENABLE_TK8S="__ENABLE_TK8S__"
       USERNAME="__VM_USER__"
+      HOME_DIR="/home/${USERNAME}"
       if [ "$ENABLE_TK8S" != "true" ]; then
           echo "[tk8s-install] ENABLE_TK8S=$ENABLE_TK8S, skip."
           exit 0
+      fi
+      # 前置檢查：setup-tools.sh 若在 cloud-init 階段下載失敗，
+      # ~/tk/wulin 不存在，kcn 掛載時會報 "host directory cannot be empty"。
+      if [ ! -d "${HOME_DIR}/tk/wulin" ]; then
+          echo "[tk8s-install] ERROR: ${HOME_DIR}/tk/wulin not found."
+          echo "[tk8s-install] taroko package may have failed to download during cloud-init."
+          echo "[tk8s-install] Re-downloading taroko package..."
+          rm -rf "${HOME_DIR}/tk"
+          curl -sL http://www.oc99.org/zip/tk2026v1.0.zip -o /tmp/tk2026v1.0.zip \
+              && unzip -q /tmp/tk2026v1.0.zip -d "${HOME_DIR}" \
+              && rm -f /tmp/tk2026v1.0.zip \
+              && chown -R "${USERNAME}:${USERNAME}" "${HOME_DIR}/tk" \
+              && echo "[tk8s-install] taroko package re-downloaded ok." \
+              || { echo "[tk8s-install] FATAL: taroko download failed, aborting."; exit 1; }
+      fi
+      if [ ! -d "${HOME_DIR}/cni" ] || [ -z "$(ls -A ${HOME_DIR}/cni 2>/dev/null)" ]; then
+          echo "[tk8s-install] WARNING: ${HOME_DIR}/cni missing or empty, CNI plugins may not work."
       fi
       echo "[tk8s-install] Running kto tk8s as $USERNAME..."
       # su - 已是 login shell，會 source /etc/profile + ~/.profile（PATH 含 ~/tk/bin），
       # 不需要再套一層 bash --login -c。
       su - "$USERNAME" -c 'kto tk8s' \
           && echo "[tk8s-install] kto tk8s completed." \
-          || echo "[tk8s-install] kto tk8s failed — check ~/tk logs."
+          || echo "[tk8s-install] kto tk8s failed — check /tmp/*.out (e.g. /tmp/tk8s-control-plane.out)"
 
   # tk8s-post-boot.service: 第二次 boot（cloud-init reboot 後）才執行 tk8s 安裝。
   # ConditionPathExists 確保只跑一次；After=network-online 保證 kto tk8s 拉 image 時網路 OK。
