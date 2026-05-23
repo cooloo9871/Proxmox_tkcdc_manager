@@ -308,10 +308,24 @@ write_files:
       # ── taroko package ───────────────────────────────────────────
       echo "[setup-tools] Downloading taroko package..."
       rm -rf "${HOME_DIR}/tk"
-      curl -sL http://www.oc99.org/zip/tk2026v1.0.zip -o /tmp/tk2026v1.0.zip
-      unzip -q /tmp/tk2026v1.0.zip -d "${HOME_DIR}"
-      rm -f /tmp/tk2026v1.0.zip
-      chown -R "${USERNAME}:${USERNAME}" "${HOME_DIR}/tk"
+      _attempt=0
+      while true; do
+          _attempt=$(( _attempt + 1 ))
+          echo "[setup-tools] taroko download attempt ${_attempt}..."
+          rm -f /tmp/tk2026v1.0.zip
+          if curl -fL --retry 3 --retry-delay 5 \
+                  http://www.oc99.org/zip/tk2026v1.0.zip -o /tmp/tk2026v1.0.zip \
+              && unzip -q /tmp/tk2026v1.0.zip -d "${HOME_DIR}" \
+              && [ -d "${HOME_DIR}/tk" ]; then
+              rm -f /tmp/tk2026v1.0.zip
+              chown -R "${USERNAME}:${USERNAME}" "${HOME_DIR}/tk"
+              echo "[setup-tools] taroko package downloaded ok."
+              break
+          fi
+          echo "[setup-tools] taroko download failed (attempt ${_attempt}), retrying in 30s..."
+          rm -f /tmp/tk2026v1.0.zip
+          sleep 30
+      done
 
       # ── .kube config ─────────────────────────────────────────────
       mkdir -p "${HOME_DIR}/.kube"
@@ -518,12 +532,24 @@ write_files:
           echo "[tk8s-install] taroko package may have failed to download during cloud-init."
           echo "[tk8s-install] Re-downloading taroko package..."
           rm -rf "${HOME_DIR}/tk"
-          curl -sL http://www.oc99.org/zip/tk2026v1.0.zip -o /tmp/tk2026v1.0.zip \
-              && unzip -q /tmp/tk2026v1.0.zip -d "${HOME_DIR}" \
-              && rm -f /tmp/tk2026v1.0.zip \
-              && chown -R "${USERNAME}:${USERNAME}" "${HOME_DIR}/tk" \
-              && echo "[tk8s-install] taroko package re-downloaded ok." \
-              || { echo "[tk8s-install] FATAL: taroko download failed, aborting."; exit 1; }
+          _attempt=0
+          while true; do
+              _attempt=$(( _attempt + 1 ))
+              echo "[tk8s-install] taroko download attempt ${_attempt}..."
+              rm -f /tmp/tk2026v1.0.zip
+              if curl -fL --retry 3 --retry-delay 5 \
+                      http://www.oc99.org/zip/tk2026v1.0.zip -o /tmp/tk2026v1.0.zip \
+                  && unzip -q /tmp/tk2026v1.0.zip -d "${HOME_DIR}" \
+                  && [ -d "${HOME_DIR}/tk" ]; then
+                  rm -f /tmp/tk2026v1.0.zip
+                  chown -R "${USERNAME}:${USERNAME}" "${HOME_DIR}/tk"
+                  echo "[tk8s-install] taroko package re-downloaded ok."
+                  break
+              fi
+              echo "[tk8s-install] taroko download failed (attempt ${_attempt}), retrying in 30s..."
+              rm -f /tmp/tk2026v1.0.zip
+              sleep 30
+          done
       fi
       if [ ! -d "${HOME_DIR}/cni" ] || [ -z "$(ls -A ${HOME_DIR}/cni 2>/dev/null)" ]; then
           echo "[tk8s-install] WARNING: ${HOME_DIR}/cni missing or empty, CNI plugins may not work."
